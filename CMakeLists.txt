@@ -7,8 +7,10 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CUDA_STANDARD 17)
 set(CMAKE_CUDA_STANDARD_REQUIRED ON)
 
-# CUDA architectures: SM 8.0, 8.6, 8.9
-set(CMAKE_CUDA_ARCHITECTURES 80 86 89)
+# CUDA architectures — use "-real" to embed SASS only (no PTX), keeping
+# the last arch with PTX for forward-compatibility via JIT.
+# Override with -DCMAKE_CUDA_ARCHITECTURES=... for local single-GPU builds.
+set(CMAKE_CUDA_ARCHITECTURES "80-real;86-real;89")
 
 # Require CUDA 12.0+
 find_package(CUDAToolkit 12.0 REQUIRED)
@@ -16,10 +18,14 @@ find_package(CUDAToolkit 12.0 REQUIRED)
 # NVCC flags
 set(CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS} -O3 --use_fast_math --expt-relaxed-constexpr")
 
-# MSVC flags (Windows)
+# Platform-specific compiler and linker flags
 if(MSVC)
     set(CMAKE_CXX_FLAGS_RELEASE "/O2 /DNDEBUG")
     set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} /O2 /DNDEBUG")
+else()
+    # Strip debug symbols in Release builds (saves 50-100 MB)
+    set(CMAKE_EXE_LINKER_FLAGS_RELEASE "${CMAKE_EXE_LINKER_FLAGS_RELEASE} -s")
+    set(CMAKE_CXX_FLAGS_RELEASE "${CMAKE_CXX_FLAGS_RELEASE} -O2 -DNDEBUG")
 endif()
 
 # Include directories
@@ -90,16 +96,6 @@ target_include_directories(cudasep_infer PRIVATE
     ${CMAKE_SOURCE_DIR}/src
     ${CUDNN_INCLUDE_DIR}
 )
-
-# Windows: Copy cuDNN DLLs to build output for runtime
-if(WIN32 AND DEFINED CUDNN_ROOT)
-    set(CUDNN_BIN_DIR "${CUDNN_ROOT}/bin")
-    file(GLOB CUDNN_DLLS "${CUDNN_BIN_DIR}/*.dll")
-    foreach(dll ${CUDNN_DLLS})
-        add_custom_command(TARGET cudasep_infer POST_BUILD
-            COMMAND ${CMAKE_COMMAND} -E copy_if_different ${dll} $<TARGET_FILE_DIR:cudasep_infer>)
-    endforeach()
-endif()
 
 # Optional Python bindings
 option(BUILD_PYTHON_BINDINGS "Build Python bindings via pybind11" OFF)

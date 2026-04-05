@@ -96,7 +96,7 @@ jobs:
           cmake -S . -B build `
             -G Ninja `
             -DCMAKE_BUILD_TYPE=${{ env.BUILD_TYPE }} `
-            -DCMAKE_CUDA_ARCHITECTURES="80;86;89;90" `
+            -DCMAKE_CUDA_ARCHITECTURES="80-real;86-real;89-real;90" `
             -DCUDNN_INCLUDE_DIR="$cudnnInclude" `
             -DCUDNN_LIB_DIR="cudnn_libs"
 
@@ -112,15 +112,14 @@ jobs:
           # Copy executable
           Copy-Item "build/cudasep_infer.exe" $distDir/
 
-          # Copy cuDNN DLLs
-          $dllDir = Join-Path $env:CUDNN_ROOT "bin"
-          Get-ChildItem "$dllDir/*.dll" | Copy-Item -Destination $distDir/
-
           # Copy conversion tools
           New-Item -ItemType Directory -Force -Path "$distDir/tools" | Out-Null
           Copy-Item "tools/convert_weights.py" "$distDir/tools/"
           Copy-Item "tools/batch_convert_and_upload.py" "$distDir/tools/"
 
+          # Show sizes
+          Write-Host "Binary size:"
+          Get-ChildItem "$distDir/cudasep_infer.exe" | Select-Object Name, @{N='MB';E={[math]::Round($_.Length/1MB,1)}}
           Write-Host "Package contents:"
           Get-ChildItem -Recurse $distDir | ForEach-Object { $_.FullName }
 
@@ -191,12 +190,18 @@ jobs:
           cmake -S . -B build \
             -G Ninja \
             -DCMAKE_BUILD_TYPE=${{ env.BUILD_TYPE }} \
-            -DCMAKE_CUDA_ARCHITECTURES="80;86;89;90" \
+            -DCMAKE_CUDA_ARCHITECTURES="80-real;86-real;89-real;90" \
             -DCUDNN_INCLUDE_DIR="$CUDNN_ROOT/include" \
             -DCUDNN_LIB_DIR="$CUDNN_ROOT/lib"
 
       - name: Build
         run: cmake --build build --config ${{ env.BUILD_TYPE }} -j$(nproc)
+
+      - name: Strip binary
+        run: |
+          strip --strip-all build/cudasep_infer
+          echo "Binary size after strip:"
+          ls -lh build/cudasep_infer
 
       - name: Package artifacts
         run: |
@@ -206,16 +211,13 @@ jobs:
           cp build/cudasep_infer dist/cudasep-linux-x64/
           chmod +x dist/cudasep-linux-x64/cudasep_infer
 
-          # cuDNN shared libs
-          cp "$CUDNN_ROOT"/lib/libcudnn*.so* dist/cudasep-linux-x64/ 2>/dev/null || true
-
           # Tools
           mkdir -p dist/cudasep-linux-x64/tools
           cp tools/convert_weights.py dist/cudasep-linux-x64/tools/
           cp tools/batch_convert_and_upload.py dist/cudasep-linux-x64/tools/
 
           echo "Package contents:"
-          find dist/cudasep-linux-x64/ -type f
+          find dist/cudasep-linux-x64/ -type f -exec ls -lh {} \;
 
       - name: Upload Linux artifacts
         uses: actions/upload-artifact@v4
