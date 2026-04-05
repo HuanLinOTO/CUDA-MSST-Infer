@@ -37,6 +37,10 @@ endif()
 if(NOT DEFINED CUDNN_LIB_DIR)
     set(CUDNN_LIB_DIR "${CMAKE_SOURCE_DIR}/cudnn_libs" CACHE PATH "cuDNN library directory")
 endif()
+# Ensure CUDNN_LIB_DIR is absolute (CI may pass relative path)
+if(NOT IS_ABSOLUTE "${CUDNN_LIB_DIR}")
+    get_filename_component(CUDNN_LIB_DIR "${CMAKE_SOURCE_DIR}/${CUDNN_LIB_DIR}" ABSOLUTE)
+endif()
 include_directories(${CUDNN_INCLUDE_DIR})
 
 # Collect source files
