@@ -1,0 +1,247 @@
+name: Build CudaInfer
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      cuda_version:
+        description: "CUDA Toolkit version"
+        required: false
+        default: "12.8.1"
+        type: choice
+        options:
+          - "12.8.1"
+          - "12.6.3"
+          - "12.4.1"
+      build_type:
+        description: "Build type"
+        required: false
+        default: "Release"
+        type: choice
+        options:
+          - Release
+          - Debug
+
+env:
+  BUILD_TYPE: ${{ inputs.build_type || 'Release' }}
+  CUDA_VERSION: ${{ inputs.cuda_version || '12.8.1' }}
+
+jobs:
+  # ===========================================================================
+  # Windows Build
+  # ===========================================================================
+  build-windows:
+    name: Windows (CUDA ${{ inputs.cuda_version || '12.8.1' }})
+    runs-on: windows-latest
+    timeout-minutes: 60
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Install CUDA Toolkit
+        uses: Jimver/cuda-toolkit@v0.2.21
+        id: cuda-toolkit
+        with:
+          cuda: ${{ env.CUDA_VERSION }}
+          method: "network"
+          sub-packages: '["nvcc", "cudart", "cublas", "cublas_dev", "cufft", "cufft_dev", "visual_studio_integration"]'
+
+      - name: Install cuDNN
+        shell: pwsh
+        run: |
+          # Install cuDNN from pip
+          pip install nvidia-cudnn-cu12==9.5.1.17
+          # Find cuDNN path
+          $cudnnPath = python -c "import nvidia.cudnn; import os; print(os.path.dirname(nvidia.cudnn.__file__))"
+          echo "CUDNN_ROOT=$cudnnPath" >> $env:GITHUB_ENV
+
+          # Create import library directory
+          $libDir = "cudnn_libs"
+          New-Item -ItemType Directory -Force -Path $libDir | Out-Null
+
+          # Generate import libraries from DLLs
+          $dllDir = Join-Path $cudnnPath "bin"
+          $dlls = Get-ChildItem "$dllDir/*.dll" | Where-Object { $_.Name -match 'cudnn.*_9\.dll$' }
+          foreach ($dll in $dlls) {
+            $baseName = [System.IO.Path]::GetFileNameWithoutExtension($dll.Name)
+            $defFile = Join-Path $libDir "$baseName.def"
+            $libFile = Join-Path $libDir "$baseName.lib"
+
+            # Export symbols from DLL
+            & dumpbin /exports $dll.FullName | Select-String "^\s+\d+\s+[0-9A-Fa-f]+\s+[0-9A-Fa-f]+\s+(\S+)" |
+              ForEach-Object { $_.Matches[0].Groups[1].Value } |
+              Set-Variable -Name exports
+
+            # Write .def file
+            "LIBRARY $baseName" | Set-Content $defFile
+            "EXPORTS" | Add-Content $defFile
+            $exports | ForEach-Object { "    $_" } | Add-Content $defFile
+
+            # Generate .lib
+            & lib /def:$defFile /out:$libFile /machine:x64 2>$null
+            Write-Host "Generated: $libFile"
+          }
+
+      - name: Configure CMake
+        shell: pwsh
+        run: |
+          $cudnnInclude = Join-Path $env:CUDNN_ROOT "include"
+          cmake -S . -B build `
+            -G Ninja `
+            -DCMAKE_BUILD_TYPE=${{ env.BUILD_TYPE }} `
+            -DCMAKE_CUDA_ARCHITECTURES="80;86;89;90" `
+            -DCUDNN_INCLUDE_DIR="$cudnnInclude" `
+            -DCUDNN_LIB_DIR="cudnn_libs"
+
+      - name: Build
+        run: cmake --build build --config ${{ env.BUILD_TYPE }} -j
+
+      - name: Package artifacts
+        shell: pwsh
+        run: |
+          $distDir = "dist/cudasep-windows-x64"
+          New-Item -ItemType Directory -Force -Path $distDir | Out-Null
+
+          # Copy executable
+          Copy-Item "build/cudasep_infer.exe" $distDir/
+
+          # Copy cuDNN DLLs
+          $dllDir = Join-Path $env:CUDNN_ROOT "bin"
+          Get-ChildItem "$dllDir/*.dll" | Copy-Item -Destination $distDir/
+
+          # Copy conversion tools
+          New-Item -ItemType Directory -Force -Path "$distDir/tools" | Out-Null
+          Copy-Item "tools/convert_weights.py" "$distDir/tools/"
+          Copy-Item "tools/batch_convert_and_upload.py" "$distDir/tools/"
+
+          Write-Host "Package contents:"
+          Get-ChildItem -Recurse $distDir | ForEach-Object { $_.FullName }
+
+      - name: Upload Windows artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: cudasep-windows-x64-cuda${{ env.CUDA_VERSION }}
+          path: dist/cudasep-windows-x64/
+          if-no-files-found: error
+
+  # ===========================================================================
+  # Linux Build
+  # ===========================================================================
+  build-linux:
+    name: Linux (CUDA ${{ inputs.cuda_version || '12.8.1' }})
+    runs-on: ubuntu-22.04
+    timeout-minutes: 60
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Free disk space
+        run: |
+          df -h
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc
+          df -h
+
+      - name: Install CUDA Toolkit
+        uses: Jimver/cuda-toolkit@v0.2.21
+        id: cuda-toolkit
+        with:
+          cuda: ${{ env.CUDA_VERSION }}
+          method: "network"
+          sub-packages: '["nvcc", "cudart", "cublas", "cublas_dev", "cufft", "cufft_dev"]'
+
+      - name: Install cuDNN
+        run: |
+          pip install nvidia-cudnn-cu12==9.5.1.17
+          CUDNN_PATH=$(python3 -c "import nvidia.cudnn; import os; print(os.path.dirname(nvidia.cudnn.__file__))")
+          echo "CUDNN_ROOT=$CUDNN_PATH" >> $GITHUB_ENV
+          echo "cuDNN installed at: $CUDNN_PATH"
+          ls -la "$CUDNN_PATH/lib/" || true
+          ls -la "$CUDNN_PATH/include/" || true
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ninja-build ffmpeg
+
+      - name: Configure CMake
+        run: |
+          cmake -S . -B build \
+            -G Ninja \
+            -DCMAKE_BUILD_TYPE=${{ env.BUILD_TYPE }} \
+            -DCMAKE_CUDA_ARCHITECTURES="80;86;89;90" \
+            -DCUDNN_INCLUDE_DIR="$CUDNN_ROOT/include" \
+            -DCUDNN_LIB_DIR="$CUDNN_ROOT/lib"
+
+      - name: Build
+        run: cmake --build build --config ${{ env.BUILD_TYPE }} -j$(nproc)
+
+      - name: Package artifacts
+        run: |
+          mkdir -p dist/cudasep-linux-x64
+
+          # Executable
+          cp build/cudasep_infer dist/cudasep-linux-x64/
+          chmod +x dist/cudasep-linux-x64/cudasep_infer
+
+          # cuDNN shared libs
+          cp "$CUDNN_ROOT"/lib/libcudnn*.so* dist/cudasep-linux-x64/ 2>/dev/null || true
+
+          # Tools
+          mkdir -p dist/cudasep-linux-x64/tools
+          cp tools/convert_weights.py dist/cudasep-linux-x64/tools/
+          cp tools/batch_convert_and_upload.py dist/cudasep-linux-x64/tools/
+
+          echo "Package contents:"
+          find dist/cudasep-linux-x64/ -type f
+
+      - name: Upload Linux artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: cudasep-linux-x64-cuda${{ env.CUDA_VERSION }}
+          path: dist/cudasep-linux-x64/
+          if-no-files-found: error
+
+  # ===========================================================================
+  # Create Release (on tag push)
+  # ===========================================================================
+  release:
+    name: Create Release
+    needs: [build-windows, build-linux]
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts/
+
+      - name: Create release archives
+        run: |
+          cd artifacts
+          for dir in */; do
+            name="${dir%/}"
+            echo "Packaging $name..."
+            tar -czf "../${name}.tar.gz" -C "$dir" .
+            (cd "$dir" && zip -r "../../${name}.zip" .)
+          done
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          generate_release_notes: true
+          files: |
+            *.tar.gz
+            *.zip
