@@ -50,6 +50,9 @@ jobs:
           method: "network"
           sub-packages: '["nvcc", "cudart", "cublas", "cublas_dev", "cufft", "cufft_dev", "visual_studio_integration"]'
 
+      - name: Setup MSVC
+        uses: ilammy/msvc-dev-cmd@v1
+
       - name: Install cuDNN
         shell: pwsh
         run: |
@@ -154,7 +157,8 @@ jobs:
         with:
           cuda: ${{ env.CUDA_VERSION }}
           method: "network"
-          sub-packages: '["nvcc", "cudart", "cublas", "cublas_dev", "cufft", "cufft_dev"]'
+          sub-packages: '["nvcc", "cudart"]'
+          non-cuda-sub-packages: '["libcublas-dev", "libcufft-dev"]'
 
       - name: Install cuDNN
         run: |
