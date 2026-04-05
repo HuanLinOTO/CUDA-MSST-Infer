@@ -43,7 +43,7 @@ jobs:
           submodules: recursive
 
       - name: Install CUDA Toolkit
-        uses: Jimver/cuda-toolkit@v0.2.21
+        uses: Jimver/cuda-toolkit@v0.2.35
         id: cuda-toolkit
         with:
           cuda: ${{ env.CUDA_VERSION }}
@@ -149,7 +149,7 @@ jobs:
           df -h
 
       - name: Install CUDA Toolkit
-        uses: Jimver/cuda-toolkit@v0.2.21
+        uses: Jimver/cuda-toolkit@v0.2.35
         id: cuda-toolkit
         with:
           cuda: ${{ env.CUDA_VERSION }}
