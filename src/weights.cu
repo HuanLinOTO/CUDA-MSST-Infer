@@ -8,6 +8,49 @@
 namespace cudasep {
 
 // ============================================================================
+// JsonObjectData – the PIMPL body hidden from the header
+// ============================================================================
+struct JsonObjectData {
+    std::unordered_map<std::string, JsonValue> data;
+};
+
+// ============================================================================
+// JsonValue – Big-5 special members (need JsonObjectData to be complete)
+// ============================================================================
+
+JsonValue::JsonValue()
+    : type_(Null), bool_val_(false), number_val_(0.0) {}
+
+JsonValue::~JsonValue() = default;
+
+JsonValue::JsonValue(const JsonValue& other)
+    : type_(other.type_), bool_val_(other.bool_val_),
+      number_val_(other.number_val_), string_val_(other.string_val_),
+      array_val_(other.array_val_) {
+    if (other.object_val_)
+        object_val_ = std::make_unique<JsonObjectData>(*other.object_val_);
+}
+
+JsonValue::JsonValue(JsonValue&& other) noexcept = default;
+
+JsonValue& JsonValue::operator=(const JsonValue& other) {
+    if (this != &other) {
+        type_       = other.type_;
+        bool_val_   = other.bool_val_;
+        number_val_ = other.number_val_;
+        string_val_ = other.string_val_;
+        array_val_  = other.array_val_;
+        if (other.object_val_)
+            object_val_ = std::make_unique<JsonObjectData>(*other.object_val_);
+        else
+            object_val_.reset();
+    }
+    return *this;
+}
+
+JsonValue& JsonValue::operator=(JsonValue&& other) noexcept = default;
+
+// ============================================================================
 // JsonValue – accessors
 // ============================================================================
 
@@ -29,7 +72,7 @@ const std::string& JsonValue::as_string() const {
 
 size_t JsonValue::size() const {
     if (type_ == Array)  return array_val_.size();
-    if (type_ == Object) return object_val_.size();
+    if (type_ == Object) return object_val_->data.size();
     throw std::runtime_error("JsonValue: size() called on non-container");
 }
 
@@ -42,15 +85,15 @@ const JsonValue& JsonValue::operator[](size_t index) const {
 
 const JsonValue& JsonValue::operator[](const std::string& key) const {
     if (type_ != Object) throw std::runtime_error("JsonValue: not an object");
-    auto it = object_val_.find(key);
-    if (it == object_val_.end())
+    auto it = object_val_->data.find(key);
+    if (it == object_val_->data.end())
         throw std::runtime_error("JsonValue: key not found: " + key);
     return it->second;
 }
 
 bool JsonValue::has(const std::string& key) const {
     if (type_ != Object) return false;
-    return object_val_.count(key) > 0;
+    return object_val_->data.count(key) > 0;
 }
 
 int JsonValue::get_int(const std::string& key, int def) const {
@@ -109,7 +152,8 @@ JsonValue JsonValue::make_array(std::vector<JsonValue> v) {
 JsonValue JsonValue::make_object(std::unordered_map<std::string, JsonValue> v) {
     JsonValue j;
     j.type_ = Object;
-    j.object_val_ = std::move(v);
+    j.object_val_ = std::make_unique<JsonObjectData>();
+    j.object_val_->data = std::move(v);
     return j;
 }
 

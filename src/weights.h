@@ -3,9 +3,15 @@
 #include <string>
 #include <unordered_map>
 #include <vector>
+#include <memory>
 #include <stdexcept>
 
 namespace cudasep {
+
+// Forward declaration – hides std::unordered_map<string,JsonValue> from the
+// header so that nvcc + GCC 11 never needs to instantiate std::pair with an
+// incomplete JsonValue inside the class body.
+struct JsonObjectData;
 
 // ============================================================================
 // Minimal JSON value type (sufficient for model configs)
@@ -14,7 +20,14 @@ class JsonValue {
 public:
     enum Type { Null, Bool, Number, String, Array, Object };
 
-    JsonValue() : type_(Null), bool_val_(false), number_val_(0.0) {}
+    // Big-5 declared out-of-line (defined in weights.cpp) because the
+    // destructor / copy / move need JsonObjectData to be complete.
+    JsonValue();
+    ~JsonValue();
+    JsonValue(const JsonValue& other);
+    JsonValue(JsonValue&& other) noexcept;
+    JsonValue& operator=(const JsonValue& other);
+    JsonValue& operator=(JsonValue&& other) noexcept;
 
     // Type queries
     bool is_null()   const { return type_ == Null; }
@@ -60,7 +73,7 @@ private:
     double number_val_;
     std::string string_val_;
     std::vector<JsonValue> array_val_;
-    std::unordered_map<std::string, JsonValue> object_val_;
+    std::unique_ptr<JsonObjectData> object_val_;  // PIMPL – avoids incomplete-type error
 };
 
 // ============================================================================
