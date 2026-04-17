@@ -38,6 +38,8 @@ namespace fs = std::filesystem;
 
 enum class ModelType { Unknown, MelBandRoformer, BSRoformer, MDX23C, HTDemucs };
 
+enum class ChunkMode { Generic, Demucs };
+
 static const char* model_type_name(ModelType t) {
     switch (t) {
         case ModelType::MelBandRoformer: return "MelBandRoformer";
@@ -46,6 +48,36 @@ static const char* model_type_name(ModelType t) {
         case ModelType::HTDemucs:        return "HTDemucs";
         default:                         return "Unknown";
     }
+}
+
+static int default_num_overlap(const cudasep::JsonValue& config, ModelType t) {
+    if (config.has("num_overlap")) {
+        return std::max(1, config.get_int("num_overlap", 1));
+    }
+
+    switch (t) {
+        case ModelType::MelBandRoformer:
+        case ModelType::BSRoformer:
+            return 2;
+        case ModelType::MDX23C:
+        case ModelType::HTDemucs:
+            return 4;
+        default:
+            return 4;
+    }
+}
+
+static int resolve_step(int chunk_size, float overlap_arg, int default_overlap, ChunkMode mode) {
+    if (overlap_arg > 0.0f && overlap_arg < 1.0f) {
+        int step = (int)std::lround(chunk_size * (1.0f - overlap_arg));
+        return std::max(1, step);
+    }
+
+    int num_overlap = default_overlap;
+    if (overlap_arg >= 1.0f) {
+        num_overlap = std::max(1, (int)std::lround(overlap_arg));
+    }
+    return std::max(1, chunk_size / std::max(1, num_overlap));
 }
 
 static ModelType detect_model_type(const cudasep::JsonValue& config) {
@@ -92,17 +124,24 @@ static ModelType detect_model_type(const cudasep::JsonValue& config) {
 static cudasep::Tensor process_chunked(
     const cudasep::Tensor& audio,  // [1, channels, samples]
     int chunk_size,
-    float overlap,
+    int step,
+    ChunkMode mode,
     std::function<cudasep::Tensor(const cudasep::Tensor&)> model_forward
 ) {
-    int64_t total_samples = audio.size(-1);
+    cudasep::Tensor mix = audio;
+    int64_t length_init = audio.size(-1);
 
-    if (total_samples <= chunk_size) {
-        return model_forward(audio);
+    int fade_size = 0;
+    int border = 0;
+    if (mode == ChunkMode::Generic) {
+        fade_size = chunk_size / 10;
+        border = chunk_size - step;
+        if (length_init > 2LL * border && border > 0) {
+            mix = mix.pad_reflect({border, border});
+        }
     }
 
-    int step = (int)(chunk_size * (1.0f - overlap));
-    if (step <= 0) step = chunk_size / 2;
+    int64_t total_samples = mix.size(-1);
 
     // Count chunks
     int num_chunks = 0;
@@ -114,9 +153,13 @@ static cudasep::Tensor process_chunked(
               << "(chunk=" << chunk_size << ", step=" << step << ")" << std::endl;
 
     // First pass: determine output shape from first chunk
-    cudasep::Tensor first_chunk = audio.slice(-1, 0, std::min((int64_t)chunk_size, total_samples));
+    cudasep::Tensor first_chunk = mix.slice(-1, 0, std::min((int64_t)chunk_size, total_samples));
     if (first_chunk.size(-1) < chunk_size) {
-        first_chunk = first_chunk.pad({0, chunk_size - first_chunk.size(-1)}, 0.0f);
+        if (mode == ChunkMode::Generic && first_chunk.size(-1) > chunk_size / 2) {
+            first_chunk = first_chunk.pad_reflect({0, chunk_size - first_chunk.size(-1)});
+        } else {
+            first_chunk = first_chunk.pad({0, chunk_size - first_chunk.size(-1)}, 0.0f);
+        }
     }
     cudasep::Tensor first_out = model_forward(first_chunk);
 
@@ -124,11 +167,19 @@ static cudasep::Tensor process_chunked(
     std::vector<int64_t> out_shape = first_out.shape();
     out_shape.back() = total_samples;
 
-    // Create Hann fade window on GPU [chunk_size]
-    std::vector<float> fade(chunk_size);
-    for (int i = 0; i < chunk_size; i++) {
-        float t = (float)i / (chunk_size - 1);
-        fade[i] = 0.5f - 0.5f * std::cos(2.0f * 3.14159265f * t);
+    // Match MSST generic overlap-add: linear fade, ones in the middle.
+    std::vector<float> fade(chunk_size, 1.0f);
+    if (mode == ChunkMode::Generic && fade_size > 0) {
+        if (fade_size == 1) {
+            fade.front() = 0.0f;
+            fade.back() = 0.0f;
+        } else {
+            for (int i = 0; i < fade_size; ++i) {
+                float alpha = (float)i / (float)(fade_size - 1);
+                fade[i] = alpha;
+                fade[chunk_size - fade_size + i] = 1.0f - alpha;
+            }
+        }
     }
     cudasep::Tensor fade_tensor = cudasep::Tensor::from_cpu_f32(fade.data(), {(int64_t)chunk_size});
 
@@ -149,9 +200,13 @@ static cudasep::Tensor process_chunked(
         if (chunk_idx == 0) {
             chunk_out = first_out;
         } else {
-            cudasep::Tensor chunk = audio.slice(-1, start, end);
+            cudasep::Tensor chunk = mix.slice(-1, start, end);
             if (actual_len < chunk_size) {
-                chunk = chunk.pad({0, chunk_size - actual_len}, 0.0f);
+                if (mode == ChunkMode::Generic && actual_len > chunk_size / 2) {
+                    chunk = chunk.pad_reflect({0, chunk_size - actual_len});
+                } else {
+                    chunk = chunk.pad({0, chunk_size - actual_len}, 0.0f);
+                }
             }
             chunk_out = model_forward(chunk);
         }
@@ -165,9 +220,23 @@ static cudasep::Tensor process_chunked(
         chunk_out = chunk_out.reshape({num_channels, actual_len}).contiguous();
 
         // Get fade window cropped to actual_len
+        cudasep::Tensor window = fade_tensor;
+        if (mode == ChunkMode::Generic && fade_size > 0) {
+            window = fade_tensor.clone();
+            if (start == 0) {
+                std::vector<float> window_cpu = window.to_cpu_f32();
+                std::fill(window_cpu.begin(), window_cpu.begin() + fade_size, 1.0f);
+                window = cudasep::Tensor::from_cpu_f32(window_cpu.data(), {(int64_t)chunk_size});
+            } else if (start + step >= total_samples) {
+                std::vector<float> window_cpu = window.to_cpu_f32();
+                std::fill(window_cpu.end() - fade_size, window_cpu.end(), 1.0f);
+                window = cudasep::Tensor::from_cpu_f32(window_cpu.data(), {(int64_t)chunk_size});
+            }
+        }
+
         cudasep::Tensor fade_crop = (actual_len < chunk_size)
-            ? fade_tensor.slice(0, 0, actual_len).contiguous()
-            : fade_tensor;
+            ? window.slice(0, 0, actual_len).contiguous()
+            : window;
 
         // GPU-side overlap-add: output[:, start:start+actual_len] += chunk_out * fade
         cudasep::ops::overlap_add(output, chunk_out, fade_crop, start);
@@ -186,6 +255,10 @@ static cudasep::Tensor process_chunked(
     // Reshape back to original output shape
     output = output.reshape(out_shape);
 
+    if (mode == ChunkMode::Generic && length_init > 2LL * border && border > 0) {
+        output = output.slice(output.ndim() - 1, border, border + length_init);
+    }
+
     return output;
 }
 
@@ -198,7 +271,7 @@ struct Args {
     std::string input_path;
     std::string output_path = "output";
     int stem = 0;
-    float overlap = 0.25f;
+    float overlap = -1.0f;
     int device = 0;
     bool list_stems = false;
     bool help = false;
@@ -244,7 +317,7 @@ static void print_usage(const char* progname) {
               << "Options:\n"
               << "  --output, -o <path>  Output directory or WAV file path (default: output)\n"
               << "  --stem, -s <int>     Stem index to extract (default: 0, -1 for all)\n"
-              << "  --overlap <float>    Overlap ratio for chunked processing (default: 0.25)\n"
+              << "  --overlap <float>    Chunk overlap. Values in (0,1) are legacy ratios; values >= 1 are MSST num_overlap. Default: model config\n"
               << "  --device, -d <int>   CUDA device ID (default: 0)\n"
               << "  --quantize, --fp16   Enable FP16 mixed-precision GEMM\n"
               << "  --list-stems         Print stem info from model config and exit\n"
@@ -322,6 +395,8 @@ int main(int argc, char** argv) {
     int num_sources = 1;
     int sample_rate = 44100;
     int chunk_size = 0;
+    int num_overlap = 4;
+    ChunkMode chunk_mode = ChunkMode::Generic;
 
     std::function<cudasep::Tensor(const cudasep::Tensor&)> model_forward;
 
@@ -332,6 +407,8 @@ int main(int argc, char** argv) {
             num_sources = mbr.config().num_stems;
             sample_rate = mbr.config().sample_rate;
             chunk_size = weights.config().get_int("chunk_size", mbr.config().stft_n_fft * 256);
+            num_overlap = default_num_overlap(weights.config(), mtype);
+            chunk_mode = ChunkMode::Generic;
             model_forward = [&](const cudasep::Tensor& x) { return mbr.forward(x); };
             break;
         case ModelType::BSRoformer:
@@ -339,6 +416,8 @@ int main(int argc, char** argv) {
             num_sources = bsr.config().num_stems;
             sample_rate = bsr.config().sample_rate;
             chunk_size = weights.config().get_int("chunk_size", bsr.config().stft_n_fft * 256);
+            num_overlap = default_num_overlap(weights.config(), mtype);
+            chunk_mode = ChunkMode::Generic;
             model_forward = [&](const cudasep::Tensor& x) { return bsr.forward(x); };
             break;
         case ModelType::MDX23C:
@@ -346,6 +425,8 @@ int main(int argc, char** argv) {
             num_sources = mdx.config().num_target_instruments;
             sample_rate = mdx.config().sample_rate;
             chunk_size = weights.config().get_int("chunk_size", mdx.config().chunk_size);
+            num_overlap = default_num_overlap(weights.config(), mtype);
+            chunk_mode = ChunkMode::Generic;
             model_forward = [&](const cudasep::Tensor& x) { return mdx.forward(x); };
             break;
         case ModelType::HTDemucs:
@@ -353,6 +434,8 @@ int main(int argc, char** argv) {
             num_sources = htd.config().num_sources;
             sample_rate = htd.config().samplerate;
             chunk_size = (int)(htd.config().segment * htd.config().samplerate);
+            num_overlap = default_num_overlap(weights.config(), mtype);
+            chunk_mode = ChunkMode::Demucs;
             model_forward = [&](const cudasep::Tensor& x) { return htd.forward(x); };
             break;
         default:
@@ -368,7 +451,8 @@ int main(int argc, char** argv) {
 
     std::cout << "  Sources: " << num_sources
               << ", Sample rate: " << sample_rate
-              << ", Chunk size: " << chunk_size << std::endl;
+              << ", Chunk size: " << chunk_size
+              << ", Num overlap: " << num_overlap << std::endl;
 
     // Handle --list-stems
     if (args.list_stems) {
@@ -431,7 +515,11 @@ int main(int argc, char** argv) {
     cudasep::Tensor output;
     try {
         if (chunk_size > 0 && audio.num_samples > chunk_size) {
-            output = process_chunked(input, chunk_size, args.overlap, model_forward);
+            int step = resolve_step(chunk_size, args.overlap, num_overlap, chunk_mode);
+            std::cout << "  Chunk mode: "
+                      << (chunk_mode == ChunkMode::Generic ? "generic" : "demucs")
+                      << ", step=" << step << std::endl;
+            output = process_chunked(input, chunk_size, step, chunk_mode, model_forward);
         } else {
             output = model_forward(input);
         }

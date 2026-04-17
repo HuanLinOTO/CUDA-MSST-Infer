@@ -70,7 +70,9 @@ private:
     // Encoder layer weights
     struct EncLayerWeights {
         Tensor conv_w, conv_b;           // main convolution
+        Tensor norm1_w, norm1_b;         // GroupNorm after conv
         Tensor rewrite_w, rewrite_b;     // 1x1 rewrite
+        Tensor norm2_w, norm2_b;         // GroupNorm after rewrite
         DConvLayer dconv;
         bool use_norm = false;           // GroupNorm after conv
         bool is_freq = true;             // true=2D conv, false=1D conv
@@ -80,6 +82,8 @@ private:
     struct DecLayerWeights {
         Tensor conv_tr_w, conv_tr_b;     // transposed convolution
         Tensor rewrite_w, rewrite_b;     // rewrite (3x3 for freq, 3 for time)
+        Tensor norm1_w, norm1_b;         // GroupNorm after rewrite
+        Tensor norm2_w, norm2_b;         // GroupNorm after conv_tr
         DConvLayer dconv;
         bool use_norm = false;
         bool is_freq = true;

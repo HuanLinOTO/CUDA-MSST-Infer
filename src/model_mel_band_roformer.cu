@@ -36,7 +36,7 @@ MBRConfig MBRConfig::from_json(const JsonValue& j) {
     c.stft_hop_length        = j.get_int("stft_hop_length", 441);
     c.stft_win_length        = j.get_int("stft_win_length", 2048);
     c.stft_normalized        = j.get_bool("stft_normalized", false);
-    c.match_input_audio_length = j.get_bool("match_input_audio_length", true);
+    c.match_input_audio_length = j.get_bool("match_input_audio_length", false);
     c.dim_freqs_in           = j.get_int("dim_freqs_in", 1025);
     c.skip_connection        = j.get_bool("skip_connection", false);
     return c;

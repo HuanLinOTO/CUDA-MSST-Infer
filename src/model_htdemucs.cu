@@ -25,7 +25,15 @@ namespace cudasep {
 
 HTDemucsConfig HTDemucsConfig::from_json(const JsonValue& j) {
     HTDemucsConfig c;
-    c.num_sources      = j.get_int("num_sources", 4);
+    if (j.has("num_sources")) {
+        c.num_sources = j.get_int("num_sources", 4);
+    } else if (j.has("sources") && j["sources"].is_array()) {
+        c.num_sources = (int)j["sources"].size();
+    } else if (j.has("instruments") && j["instruments"].is_array()) {
+        c.num_sources = (int)j["instruments"].size();
+    } else {
+        c.num_sources = 4;
+    }
     c.audio_channels   = j.get_int("audio_channels", 2);
     c.channels         = j.get_int("channels", 48);
     c.growth           = j.get_int("growth", 2);
@@ -315,13 +323,8 @@ Tensor HTDemucs::apply_enc_layer(const Tensor& x, const EncLayerWeights& w,
             y = y + inj;
         }
 
-        // Norm + GELU
-        // Note: norm_starts=4 and depth=4 by default means norm is always False.
-        // If norm were True, separate GroupNorm weights would need to be loaded.
-        // Currently unsupported for simplicity.
         if (w.use_norm) {
-            // TODO: load and apply GroupNorm weights if norm_starts < depth
-            std::cerr << "[HTDemucs] WARNING: GroupNorm in encoder not implemented, skipping" << std::endl;
+            y = ops::group_norm(y, cfg_.norm_groups, w.norm1_w, w.norm1_b);
         }
         y = ops::gelu(y);
 
@@ -341,6 +344,9 @@ Tensor HTDemucs::apply_enc_layer(const Tensor& x, const EncLayerWeights& w,
             Tensor z = ops::conv2d(y, w.rewrite_w, w.rewrite_b,
                                    /*stride_h=*/1, /*stride_w=*/1,
                                    /*pad_h=*/ctx, /*pad_w=*/ctx);
+            if (w.use_norm) {
+                z = ops::group_norm(z, cfg_.norm_groups, w.norm2_w, w.norm2_b);
+            }
             z = ops::glu(z, 1);  // GLU on channel dim
             y = z;
         }
@@ -357,7 +363,6 @@ Tensor HTDemucs::apply_enc_layer(const Tensor& x, const EncLayerWeights& w,
         int ksize = cfg_.kernel_size;
         int stride_t = cfg_.stride;
         int pad_t = ksize / 4;
-
         y = ops::conv1d(y, w.conv_w, w.conv_b, stride_t, pad_t);
 
         // Empty layer: just return conv output
@@ -370,6 +375,9 @@ Tensor HTDemucs::apply_enc_layer(const Tensor& x, const EncLayerWeights& w,
             y = y + inject;
         }
 
+        if (w.use_norm) {
+            y = ops::group_norm(y, cfg_.norm_groups, w.norm1_w, w.norm1_b);
+        }
         y = ops::gelu(y);
 
         // DConv
@@ -382,6 +390,9 @@ Tensor HTDemucs::apply_enc_layer(const Tensor& x, const EncLayerWeights& w,
             int ctx = cfg_.context_enc;
             Tensor z = ops::conv1d(y, w.rewrite_w, w.rewrite_b,
                                    /*stride=*/1, /*padding=*/ctx);
+            if (w.use_norm) {
+                z = ops::group_norm(z, cfg_.norm_groups, w.norm2_w, w.norm2_b);
+            }
             z = ops::glu(z, 1);
             y = z;
         }
@@ -436,6 +447,9 @@ std::pair<Tensor, Tensor> HTDemucs::apply_dec_layer(const Tensor& x, const Tenso
             int pW = rwW / 2;
             Tensor z = ops::conv2d(y, w.rewrite_w, w.rewrite_b,
                                    /*stride_h=*/1, /*stride_w=*/1, pH, pW);
+            if (w.use_norm) {
+                z = ops::group_norm(z, cfg_.norm_groups, w.norm1_w, w.norm1_b);
+            }
             z = ops::glu(z, 1);  // GLU on channel dim
             y = z;
 
@@ -454,12 +468,12 @@ std::pair<Tensor, Tensor> HTDemucs::apply_dec_layer(const Tensor& x, const Tenso
             // Empty decoder layer (no rewrite/dconv, skip is None)
         }
 
-        // Transposed convolution (Python ConvTranspose2d has padding=0)
-        // Python: z = self.norm2(self.conv_tr(y))
-        // norm2 is GroupNorm that we skip in default config (norm_starts >= depth)
         y = ops::conv_transpose2d(y, w.conv_tr_w, w.conv_tr_b,
                                   stride_h, /*stride_w=*/1,
                                   /*pad_h=*/0, /*pad_w=*/0);
+        if (w.use_norm) {
+            y = ops::group_norm(y, cfg_.norm_groups, w.norm2_w, w.norm2_b);
+        }
 
         // Trim frequency padding: z[..., pad:-pad, :]
         if (pad_h_val > 0) {
@@ -486,6 +500,9 @@ std::pair<Tensor, Tensor> HTDemucs::apply_dec_layer(const Tensor& x, const Tenso
             int p = k / 2;
             Tensor z = ops::conv1d(y, w.rewrite_w, w.rewrite_b,
                                    /*stride=*/1, /*padding=*/p);
+            if (w.use_norm) {
+                z = ops::group_norm(z, cfg_.norm_groups, w.norm1_w, w.norm1_b);
+            }
             z = ops::glu(z, 1);
             y = z;
 
@@ -503,8 +520,10 @@ std::pair<Tensor, Tensor> HTDemucs::apply_dec_layer(const Tensor& x, const Tenso
         int ksize = cfg_.kernel_size;
         int stride_t = cfg_.stride;
         int pad_val = ksize / 4;
-        // Python ConvTranspose1d has padding=0, output is larger, then trimmed
         y = ops::conv_transpose1d(y, w.conv_tr_w, w.conv_tr_b, stride_t, /*padding=*/0);
+        if (w.use_norm) {
+            y = ops::group_norm(y, cfg_.norm_groups, w.norm2_w, w.norm2_b);
+        }
 
         // Trim to target_length: z[..., pad:pad+length]
         y = y.slice(-1, pad_val, pad_val + target_length);
@@ -925,6 +944,10 @@ void HTDemucs::load(const ModelWeights& weights) {
         ew.conv_b = weights.get(prefix + ".conv.bias");
         ew.is_freq = enc_params[i].freq;
         ew.use_norm = enc_params[i].norm;
+        if (ew.use_norm) {
+            ew.norm1_w = weights.get(prefix + ".norm1.weight");
+            ew.norm1_b = weights.get(prefix + ".norm1.bias");
+        }
 
         // Check if this is an empty layer equivalent (only conv, no rewrite/dconv)
         // In Python: empty layers only exist in tencoder. Encoder layers always have full structure.
@@ -932,6 +955,10 @@ void HTDemucs::load(const ModelWeights& weights) {
         if (weights.has(prefix + ".rewrite.weight")) {
             ew.rewrite_w = weights.get(prefix + ".rewrite.weight");
             ew.rewrite_b = weights.get(prefix + ".rewrite.bias");
+            if (ew.use_norm) {
+                ew.norm2_w = weights.get(prefix + ".norm2.weight");
+                ew.norm2_b = weights.get(prefix + ".norm2.bias");
+            }
         }
         // DConv
         if ((cfg_.dconv_mode & 1) && weights.has(prefix + ".dconv.layers.0.0.weight")) {
@@ -948,6 +975,10 @@ void HTDemucs::load(const ModelWeights& weights) {
         ew.conv_b = weights.get(prefix + ".conv.bias");
         ew.is_freq = false;
         ew.use_norm = tenc_params[i].norm;
+        if (ew.use_norm && !tenc_params[i].empty) {
+            ew.norm1_w = weights.get(prefix + ".norm1.weight");
+            ew.norm1_b = weights.get(prefix + ".norm1.bias");
+        }
 
         if (tenc_params[i].empty) {
             // Empty layer: only conv, no norm/rewrite/dconv
@@ -956,6 +987,10 @@ void HTDemucs::load(const ModelWeights& weights) {
             if (weights.has(prefix + ".rewrite.weight")) {
                 ew.rewrite_w = weights.get(prefix + ".rewrite.weight");
                 ew.rewrite_b = weights.get(prefix + ".rewrite.bias");
+                if (ew.use_norm) {
+                    ew.norm2_w = weights.get(prefix + ".norm2.weight");
+                    ew.norm2_b = weights.get(prefix + ".norm2.bias");
+                }
             }
             if ((cfg_.dconv_mode & 1) && weights.has(prefix + ".dconv.layers.0.0.weight")) {
                 load_dconv(prefix + ".dconv", ew.dconv);
@@ -973,10 +1008,18 @@ void HTDemucs::load(const ModelWeights& weights) {
         dw.is_freq = dec_params[i].freq;
         dw.use_norm = dec_params[i].norm;
         dw.is_last = (i == depth - 1);
+        if (dw.use_norm) {
+            dw.norm2_w = weights.get(prefix + ".norm2.weight");
+            dw.norm2_b = weights.get(prefix + ".norm2.bias");
+        }
 
         if (weights.has(prefix + ".rewrite.weight")) {
             dw.rewrite_w = weights.get(prefix + ".rewrite.weight");
             dw.rewrite_b = weights.get(prefix + ".rewrite.bias");
+            if (dw.use_norm) {
+                dw.norm1_w = weights.get(prefix + ".norm1.weight");
+                dw.norm1_b = weights.get(prefix + ".norm1.bias");
+            }
         }
         if ((cfg_.dconv_mode & 2) && weights.has(prefix + ".dconv.layers.0.0.weight")) {
             load_dconv(prefix + ".dconv", dw.dconv);
@@ -995,6 +1038,10 @@ void HTDemucs::load(const ModelWeights& weights) {
         // tdecoder is stored reversed in Python; tdecoder[0] corresponds to the
         // last layer in the decoder loop (deepest). is_last for the outermost one.
         dw.is_last = (i == (int)tdec_params.size() - 1);
+        if (dw.use_norm && !tdec_params[i].empty) {
+            dw.norm2_w = weights.get(prefix + ".norm2.weight");
+            dw.norm2_b = weights.get(prefix + ".norm2.bias");
+        }
 
         if (tdec_params[i].empty) {
             // Empty layer
@@ -1002,6 +1049,10 @@ void HTDemucs::load(const ModelWeights& weights) {
             if (weights.has(prefix + ".rewrite.weight")) {
                 dw.rewrite_w = weights.get(prefix + ".rewrite.weight");
                 dw.rewrite_b = weights.get(prefix + ".rewrite.bias");
+                if (dw.use_norm) {
+                    dw.norm1_w = weights.get(prefix + ".norm1.weight");
+                    dw.norm1_b = weights.get(prefix + ".norm1.bias");
+                }
             }
             if ((cfg_.dconv_mode & 2) && weights.has(prefix + ".dconv.layers.0.0.weight")) {
                 load_dconv(prefix + ".dconv", dw.dconv);
@@ -1166,9 +1217,13 @@ Tensor HTDemucs::forward(const Tensor& mix) {
     // mean, std over (C, F, T) dims
     Tensor mean_x = x.mean(1, true).mean(2, true).mean(3, true);  // [B, 1, 1, 1]
 
-    // Compute std = sqrt(mean((x - mean)^2))
+    // Match torch.std(..., unbiased=True): sqrt(sum((x-mean)^2) / (N-1))
     Tensor x_centered = x - mean_x;
     Tensor x_var = (x_centered * x_centered).mean(1, true).mean(2, true).mean(3, true);
+    double x_count = (double)x.size(1) * (double)x.size(2) * (double)x.size(3);
+    if (x_count > 1.0) {
+        x_var.mul_scalar_((float)(x_count / (x_count - 1.0)));
+    }
     // Compute std = sqrt(var) on GPU
     Tensor std_x = ops::sqrt(x_var);
 
@@ -1185,6 +1240,10 @@ Tensor HTDemucs::forward(const Tensor& mix) {
 
     Tensor xt_centered = xt - mean_t;
     Tensor xt_var = (xt_centered * xt_centered).mean(1, true).mean(2, true);
+    double t_count = (double)xt.size(1) * (double)xt.size(2);
+    if (t_count > 1.0) {
+        xt_var.mul_scalar_((float)(t_count / (t_count - 1.0)));
+    }
     Tensor std_t = ops::sqrt(xt_var);
 
     Tensor std_t_safe = std_t.clone();

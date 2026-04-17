@@ -61,8 +61,16 @@ bool JsonValue::as_bool() const {
 }
 
 double JsonValue::as_number() const {
-    if (type_ != Number) throw std::runtime_error("JsonValue: not a number");
-    return number_val_;
+    if (type_ == Number) return number_val_;
+    if (type_ == String) {
+        try {
+            size_t pos = 0;
+            double v = std::stod(string_val_, &pos);
+            if (pos == string_val_.size()) return v;
+        } catch (...) {
+        }
+    }
+    throw std::runtime_error("JsonValue: not a number");
 }
 
 const std::string& JsonValue::as_string() const {

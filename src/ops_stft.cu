@@ -185,12 +185,13 @@ __global__ void normalize_by_window_kernel(float* __restrict__ output,
     }
 }
 
-// Hann window kernel: w[i] = 0.5 * (1 - cos(2*pi*i / (size-1)))
+// Match torch.hann_window(size) default behavior (periodic=True):
+// w[i] = 0.5 * (1 - cos(2*pi*i / size))
 __global__ void hann_window_kernel(float* __restrict__ out, int size)
 {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= size) return;
-    float phase = 2.0f * (float)M_PI * (float)i / (float)(size - 1);
+    float phase = 2.0f * (float)M_PI * (float)i / (float)size;
     out[i] = 0.5f * (1.0f - cosf(phase));
 }
 

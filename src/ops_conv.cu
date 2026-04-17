@@ -219,7 +219,7 @@ Tensor conv1d(const Tensor& x, const Tensor& weight, const Tensor& bias,
     if (groups > 1) {
         CUDNN_CHECK(cudnnSetConvolutionGroupCount(convDesc, groups));
     }
-    CUDNN_CHECK(cudnnSetConvolutionMathType(convDesc, CUDNN_TENSOR_OP_MATH));
+    CUDNN_CHECK(cudnnSetConvolutionMathType(convDesc, CUDNN_DEFAULT_MATH));
 
     CUDNN_CHECK(cudnnSetTensor4dDescriptor(yDesc, CUDNN_TENSOR_NCHW,
         CUDNN_DATA_FLOAT, B, C_out, 1, L_out));
@@ -293,7 +293,7 @@ Tensor conv2d(const Tensor& x, const Tensor& weight, const Tensor& bias,
     if (groups > 1) {
         CUDNN_CHECK(cudnnSetConvolutionGroupCount(convDesc, groups));
     }
-    CUDNN_CHECK(cudnnSetConvolutionMathType(convDesc, CUDNN_TENSOR_OP_MATH));
+    CUDNN_CHECK(cudnnSetConvolutionMathType(convDesc, CUDNN_DEFAULT_MATH));
 
     CUDNN_CHECK(cudnnSetTensor4dDescriptor(yDesc, CUDNN_TENSOR_NCHW,
         CUDNN_DATA_FLOAT, B, C_out, H_out, W_out));
@@ -362,7 +362,7 @@ Tensor conv_transpose1d(const Tensor& x, const Tensor& weight, const Tensor& bia
         1, stride, 1, 1,
         CUDNN_CROSS_CORRELATION, CUDNN_DATA_FLOAT));
 
-    CUDNN_CHECK(cudnnSetConvolutionMathType(convDesc, CUDNN_TENSOR_OP_MATH));
+    CUDNN_CHECK(cudnnSetConvolutionMathType(convDesc, CUDNN_DEFAULT_MATH));
 
     // dx (output): [B, C_out, 1, L_out]
     CUDNN_CHECK(cudnnSetTensor4dDescriptor(dxDesc, CUDNN_TENSOR_NCHW,
@@ -434,7 +434,7 @@ Tensor conv_transpose2d(const Tensor& x, const Tensor& weight, const Tensor& bia
         stride_h, stride_w, 1, 1,
         CUDNN_CROSS_CORRELATION, CUDNN_DATA_FLOAT));
 
-    CUDNN_CHECK(cudnnSetConvolutionMathType(convDesc, CUDNN_TENSOR_OP_MATH));
+    CUDNN_CHECK(cudnnSetConvolutionMathType(convDesc, CUDNN_DEFAULT_MATH));
 
     CUDNN_CHECK(cudnnSetTensor4dDescriptor(dxDesc, CUDNN_TENSOR_NCHW,
         CUDNN_DATA_FLOAT, B, C_out, H_out, W_out));

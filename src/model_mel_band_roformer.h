@@ -26,7 +26,7 @@ struct MBRConfig {
     int stft_hop_length = 441;
     int stft_win_length = 2048;
     bool stft_normalized = false;
-    bool match_input_audio_length = true;
+    bool match_input_audio_length = false;
     int dim_freqs_in = 1025;
     bool skip_connection = false;
 

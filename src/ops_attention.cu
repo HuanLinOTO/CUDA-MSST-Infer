@@ -146,7 +146,7 @@ Tensor scaled_dot_product_attention(const Tensor& q, const Tensor& k, const Tens
     // Use Flash Attention only for D <= 128 AND very long sequences
     // For shorter/medium sequences, cuBLAS with materialized attention is faster
     // because cuBLAS uses tensor cores while our Flash Attention kernel doesn't
-    if (D <= 128 && N > 4096) {
+    if (false && D <= 128 && N > 4096) {
         // Flash Attention — O(N) memory, fused kernel
         launch_flash_attention(
             qf.data_f32(),  // [B*H, N, D] (contiguous, same layout as [B,H,N,D])

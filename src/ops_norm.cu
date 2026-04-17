@@ -76,7 +76,10 @@ __device__ __forceinline__ float block_reduce_sum(float val, float* smem) {
 // 1. RMS Norm
 // ===========================================================================
 // x: [..., D], gamma: [D], scale: float
-// result = x * rsqrt(mean(x^2, dim=-1)) * gamma * scale
+// result = x * rsqrt(sum(x^2, dim=-1)) * gamma * scale
+//
+// Roformer RMSNorm in MSST uses F.normalize(x, dim=-1) * sqrt(D), i.e.
+// x / sqrt(sum(x^2)) * sqrt(D), not rsqrt(mean(x^2)) * sqrt(D).
 
 // --- Warp-only kernel (D <= 1024, one warp per row) ---
 __global__ void rms_norm_warp_kernel(const float* __restrict__ x,
@@ -99,8 +102,7 @@ __global__ void rms_norm_warp_kernel(const float* __restrict__ x,
     }
     sum_sq = warp_reduce_sum_norm(sum_sq);
 
-    // rsqrt(mean(x^2))
-    float rms_inv = rsqrtf(sum_sq / (float)D + 1e-8f);
+    float rms_inv = rsqrtf(sum_sq + 1e-12f);
 
     // Apply normalization
     for (int j = lane; j < D; j += 32) {
@@ -130,7 +132,7 @@ __global__ void rms_norm_block_kernel(const float* __restrict__ x,
     }
 
     sum_sq = block_reduce_sum(sum_sq, smem);
-    float rms_inv = rsqrtf(sum_sq / (float)D + 1e-8f);
+    float rms_inv = rsqrtf(sum_sq + 1e-12f);
 
     // Apply normalization
     for (int j = tid; j < D; j += blockDim.x) {

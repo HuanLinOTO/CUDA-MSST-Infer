@@ -79,13 +79,25 @@ def _flatten_config(yaml_cfg: dict) -> dict:
     # 'training' section — extract instruments, samplerate, segment, normalize
     if "training" in yaml_cfg and isinstance(yaml_cfg["training"], dict):
         tr = yaml_cfg["training"]
-        for key in ("instruments", "samplerate", "segment", "normalize",
-                     "target_instrument", "channels"):
+        for key in (
+            "instruments",
+            "samplerate",
+            "segment",
+            "normalize",
+            "target_instrument",
+            "channels",
+        ):
             if key in tr:
                 if key == "samplerate" and "sample_rate" not in out:
                     out["sample_rate"] = tr[key]
                 elif key not in out:
                     out[key] = tr[key]
+
+    if "inference" in yaml_cfg and isinstance(yaml_cfg["inference"], dict):
+        inf = yaml_cfg["inference"]
+        for key in ("num_overlap", "batch_size", "normalize"):
+            if key in inf and key not in out:
+                out[key] = inf[key]
 
     # Top-level scalars that don't belong to a sub-dict (legacy configs)
     skip = {"audio", "model", "training", "augmentations", "inference"}
@@ -113,7 +125,7 @@ def _load_state_dict(ckpt_path: str) -> tuple[dict[str, torch.Tensor], dict | No
             for k, v in list(extra_config.items()):
                 if isinstance(v, bool):
                     pass  # keep as bool (json.dumps handles it)
-                elif hasattr(v, 'numerator') and not isinstance(v, (int, float)):
+                elif hasattr(v, "numerator") and not isinstance(v, (int, float)):
                     extra_config[k] = float(v)  # Fraction → float
         # Common keys used by various training frameworks
         for key in ("state_dict", "model_state_dict", "model", "net", "state"):
@@ -128,9 +140,7 @@ def _load_state_dict(ckpt_path: str) -> tuple[dict[str, torch.Tensor], dict | No
             f"Cannot locate state_dict in checkpoint. Top-level keys: "
             f"{list(ckpt.keys())}"
         )
-    raise RuntimeError(
-        f"Unsupported checkpoint type: {type(ckpt).__name__}"
-    )
+    raise RuntimeError(f"Unsupported checkpoint type: {type(ckpt).__name__}")
 
 
 def _write_csm(
@@ -209,6 +219,7 @@ def _write_csm(
 
 # ---- main ------------------------------------------------------------------
 
+
 def main() -> None:
     parser = argparse.ArgumentParser(
         description="Convert a PyTorch checkpoint + YAML config to .csm format."
@@ -216,12 +227,8 @@ def main() -> None:
     parser.add_argument(
         "--checkpoint", required=True, help="Path to PyTorch .ckpt / .pth file"
     )
-    parser.add_argument(
-        "--config", required=True, help="Path to YAML config file"
-    )
-    parser.add_argument(
-        "--output", required=True, help="Output .csm file path"
-    )
+    parser.add_argument("--config", required=True, help="Path to YAML config file")
+    parser.add_argument("--output", required=True, help="Output .csm file path")
     parser.add_argument(
         "--half",
         action="store_true",
@@ -248,7 +255,7 @@ def main() -> None:
             if k not in config:
                 # Convert lists with non-serializable items
                 if isinstance(v, (list, tuple)):
-                    v = [float(x) if hasattr(x, 'numerator') else x for x in v]
+                    v = [float(x) if hasattr(x, "numerator") else x for x in v]
                 config[k] = v
         print(f"  Merged {len(extra_config)} keys from checkpoint kwargs")
 
@@ -289,25 +296,31 @@ def main() -> None:
 
         # freq_indices
         repeated_freq_indices = repeat(
-            torch.arange(num_fft_bins), 'f -> b f', b=num_bands
+            torch.arange(num_fft_bins), "f -> b f", b=num_bands
         )
         freq_indices = repeated_freq_indices[freqs_per_band]
 
         if stereo:
-            freq_indices = repeat(freq_indices, 'f -> f s', s=2)
+            freq_indices = repeat(freq_indices, "f -> f s", s=2)
             freq_indices = freq_indices * 2 + torch.arange(2)
-            freq_indices = rearrange(freq_indices, 'f s -> (f s)')
+            freq_indices = rearrange(freq_indices, "f s -> (f s)")
 
-        num_freqs_per_band = reduce(freqs_per_band, 'b f -> b', 'sum')
-        num_bands_per_freq = reduce(freqs_per_band, 'b f -> f', 'sum')
+        num_freqs_per_band = reduce(freqs_per_band, "b f -> b", "sum")
+        num_bands_per_freq = reduce(freqs_per_band, "b f -> f", "sum")
 
         # Store as extra tensors
         state_dict["__precomputed__.freq_indices"] = freq_indices.to(torch.int64)
-        state_dict["__precomputed__.num_freqs_per_band"] = num_freqs_per_band.to(torch.int64)
-        state_dict["__precomputed__.num_bands_per_freq"] = num_bands_per_freq.to(torch.int64)
+        state_dict["__precomputed__.num_freqs_per_band"] = num_freqs_per_band.to(
+            torch.int64
+        )
+        state_dict["__precomputed__.num_bands_per_freq"] = num_bands_per_freq.to(
+            torch.int64
+        )
 
         # Also store band_freq_dims as config
-        band_freq_dims = [2 * int(f) * audio_channels for f in num_freqs_per_band.tolist()]
+        band_freq_dims = [
+            2 * int(f) * audio_channels for f in num_freqs_per_band.tolist()
+        ]
         config["__band_freq_dims__"] = band_freq_dims
 
         print(f"    freq_indices: {len(freq_indices)}, bands: {num_bands}")

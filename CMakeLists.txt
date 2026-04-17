@@ -16,7 +16,7 @@ set(CMAKE_CUDA_ARCHITECTURES "80-real;86-real;89")
 find_package(CUDAToolkit 12.0 REQUIRED)
 
 # NVCC flags
-set(CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS} -O3 --use_fast_math --expt-relaxed-constexpr")
+set(CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS} -O3 --use_fast_math --expt-relaxed-constexpr --allow-unsupported-compiler")
 
 # Platform-specific compiler and linker flags
 if(MSVC)

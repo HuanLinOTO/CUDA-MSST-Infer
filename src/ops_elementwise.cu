@@ -64,11 +64,8 @@ static Tensor apply_unary(const Tensor& x, OpFunc op) {
 
 struct GeluOp {
     __device__ float operator()(float x) const {
-        // GELU(x) = 0.5 * x * (1 + tanh(sqrt(2/pi) * (x + 0.044715 * x^3)))
-        constexpr float kSqrt2OverPi = 0.7978845608028654f;
-        float cube = x * x * x;
-        float inner = kSqrt2OverPi * (x + 0.044715f * cube);
-        return 0.5f * x * (1.0f + tanhf(inner));
+        constexpr float kInvSqrt2 = 0.7071067811865475f;
+        return 0.5f * x * (1.0f + erff(x * kInvSqrt2));
     }
 };
 
