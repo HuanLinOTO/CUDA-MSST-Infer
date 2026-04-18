@@ -29,6 +29,153 @@ static std::string profile_format_ms(double ms) {
     return ss.str();
 }
 
+static constexpr int kTransformBlock = 256;
+
+__global__ void split_qkv_heads_kernel(const float* __restrict__ qkv,
+                                       float* __restrict__ q,
+                                       float* __restrict__ k,
+                                       float* __restrict__ v,
+                                       int B, int H, int N, int D) {
+    int64_t idx = (int64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    int64_t total = (int64_t)B * H * N * D;
+    if (idx >= total) return;
+
+    int d = (int)(idx % D);
+    int n = (int)((idx / D) % N);
+    int h = (int)((idx / (D * (int64_t)N)) % H);
+    int b = (int)(idx / ((int64_t)D * N * H));
+
+    int64_t head_offset = (int64_t)h * D + d;
+    int64_t base = ((int64_t)b * N + n) * (3LL * H * D);
+    q[idx] = qkv[base + head_offset];
+    k[idx] = qkv[base + (int64_t)H * D + head_offset];
+    v[idx] = qkv[base + 2LL * H * D + head_offset];
+}
+
+__global__ void split_qkv_heads_vec4_kernel(const float4* __restrict__ qkv,
+                                            float4* __restrict__ q,
+                                            float4* __restrict__ k,
+                                            float4* __restrict__ v,
+                                            int B, int H, int N, int D4) {
+    int64_t idx = (int64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    int64_t total = (int64_t)B * H * N * D4;
+    if (idx >= total) return;
+
+    int d4 = (int)(idx % D4);
+    int n = (int)((idx / D4) % N);
+    int h = (int)((idx / (D4 * (int64_t)N)) % H);
+    int b = (int)(idx / ((int64_t)D4 * N * H));
+
+    int64_t head_offset = (int64_t)h * D4 + d4;
+    int64_t base = ((int64_t)b * N + n) * (3LL * H * D4);
+    q[idx] = qkv[base + head_offset];
+    k[idx] = qkv[base + (int64_t)H * D4 + head_offset];
+    v[idx] = qkv[base + 2LL * H * D4 + head_offset];
+}
+
+__global__ void apply_gates_and_merge_heads_kernel(const float* __restrict__ attn,
+                                                   const float* __restrict__ gates,
+                                                   float* __restrict__ merged,
+                                                   int B, int H, int N, int D) {
+    int64_t idx = (int64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    int64_t total = (int64_t)B * H * N * D;
+    if (idx >= total) return;
+
+    int d = (int)(idx % D);
+    int n = (int)((idx / D) % N);
+    int h = (int)((idx / (D * (int64_t)N)) % H);
+    int b = (int)(idx / ((int64_t)D * N * H));
+
+    int64_t gate_idx = ((int64_t)b * N + n) * H + h;
+    int64_t merged_idx = ((int64_t)b * N + n) * (H * (int64_t)D) + (int64_t)h * D + d;
+    merged[merged_idx] = attn[idx] * gates[gate_idx];
+}
+
+__global__ void apply_gates_and_merge_heads_vec4_kernel(const float4* __restrict__ attn,
+                                                        const float* __restrict__ gates,
+                                                        float4* __restrict__ merged,
+                                                        int B, int H, int N, int D4) {
+    int64_t idx = (int64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    int64_t total = (int64_t)B * H * N * D4;
+    if (idx >= total) return;
+
+    int d4 = (int)(idx % D4);
+    int n = (int)((idx / D4) % N);
+    int h = (int)((idx / (D4 * (int64_t)N)) % H);
+    int b = (int)(idx / ((int64_t)D4 * N * H));
+
+    float gate = gates[((int64_t)b * N + n) * H + h];
+    float4 value = attn[idx];
+    value.x *= gate;
+    value.y *= gate;
+    value.z *= gate;
+    value.w *= gate;
+    int64_t merged_idx = ((int64_t)b * N + n) * (H * (int64_t)D4) + (int64_t)h * D4 + d4;
+    merged[merged_idx] = value;
+}
+
+static void split_qkv_heads(const Tensor& qkv, int heads, int dim_head,
+                            Tensor& q, Tensor& k, Tensor& v) {
+    int B = (int)qkv.size(0);
+    int N = (int)qkv.size(1);
+    q = Tensor::empty({(int64_t)B, (int64_t)heads, (int64_t)N, (int64_t)dim_head}, DType::Float32);
+    k = Tensor::empty({(int64_t)B, (int64_t)heads, (int64_t)N, (int64_t)dim_head}, DType::Float32);
+    v = Tensor::empty({(int64_t)B, (int64_t)heads, (int64_t)N, (int64_t)dim_head}, DType::Float32);
+    if ((dim_head % 4) == 0) {
+        int D4 = dim_head / 4;
+        int64_t total = (int64_t)B * heads * N * D4;
+        int grid = (int)((total + kTransformBlock - 1) / kTransformBlock);
+        split_qkv_heads_vec4_kernel<<<grid, kTransformBlock>>>(reinterpret_cast<const float4*>(qkv.data_f32()),
+                                                               reinterpret_cast<float4*>(q.data_f32()),
+                                                               reinterpret_cast<float4*>(k.data_f32()),
+                                                               reinterpret_cast<float4*>(v.data_f32()),
+                                                               B, heads, N, D4);
+    } else {
+        int64_t total = (int64_t)B * heads * N * dim_head;
+        int grid = (int)((total + kTransformBlock - 1) / kTransformBlock);
+        split_qkv_heads_kernel<<<grid, kTransformBlock>>>(qkv.data_f32(), q.data_f32(), k.data_f32(), v.data_f32(),
+                                                          B, heads, N, dim_head);
+    }
+    CUDA_CHECK(cudaGetLastError());
+}
+
+static Tensor apply_gates_and_merge_heads(const Tensor& attn, const Tensor& gates,
+                                          int heads, int dim_head) {
+    int B = (int)attn.size(0);
+    int N = (int)attn.size(2);
+    Tensor merged = Tensor::empty({(int64_t)B, (int64_t)N, (int64_t)heads * dim_head}, DType::Float32);
+    if ((dim_head % 4) == 0) {
+        int D4 = dim_head / 4;
+        int64_t total = (int64_t)B * heads * N * D4;
+        int grid = (int)((total + kTransformBlock - 1) / kTransformBlock);
+        apply_gates_and_merge_heads_vec4_kernel<<<grid, kTransformBlock>>>(reinterpret_cast<const float4*>(attn.data_f32()),
+                                                                           gates.data_f32(),
+                                                                           reinterpret_cast<float4*>(merged.data_f32()),
+                                                                           B, heads, N, D4);
+    } else {
+        int64_t total = (int64_t)B * heads * N * dim_head;
+        int grid = (int)((total + kTransformBlock - 1) / kTransformBlock);
+        apply_gates_and_merge_heads_kernel<<<grid, kTransformBlock>>>(attn.data_f32(), gates.data_f32(), merged.data_f32(),
+                                                                      B, heads, N, dim_head);
+    }
+    CUDA_CHECK(cudaGetLastError());
+    return merged;
+}
+
+struct ProfileScope {
+    double* target = nullptr;
+    std::chrono::high_resolution_clock::time_point start;
+    explicit ProfileScope(double* value) : target(value) {
+        if (target) start = std::chrono::high_resolution_clock::now();
+    }
+    ~ProfileScope() {
+        if (target) {
+            cudaDeviceSynchronize();
+            *target += profile_elapsed_ms(start, std::chrono::high_resolution_clock::now());
+        }
+    }
+};
+
 }
 
 // ============================================================================
@@ -370,56 +517,75 @@ Tensor MelBandRoformer::compute_rotary_cos_sin(int seq_len, int dim) {
 // ============================================================================
 
 Tensor MelBandRoformer::apply_attention(const Tensor& x, const AttentionWeights& w,
-                                         const Tensor& cos_freqs, const Tensor& sin_freqs) {
+                                          const Tensor& cos_freqs, const Tensor& sin_freqs) {
     // x: [B, N, dim]
     int dim = cfg_.dim;
     int heads = cfg_.heads;
     int dim_head = cfg_.dim_head;
     int dim_inner = heads * dim_head;
     float scale = std::sqrt((float)dim);
+    bool profile_enabled = (bool)profile_logger_;
 
     // 1. RMS Norm
-    Tensor normed = ops::rms_norm(x, w.norm_gamma, scale);
+    Tensor normed;
+    {
+        ProfileScope norm_scope(profile_enabled ? &profile_stats_.attn_norm_ms : nullptr);
+        normed = ops::rms_norm(x, w.norm_gamma, scale);
+    }
 
     // 2. QKV projection: [B, N, 3*dim_inner]
-    Tensor qkv = ops::linear_no_bias(normed, w.to_qkv_w);
+    Tensor qkv;
+    {
+        ProfileScope qkv_proj_scope(profile_enabled ? &profile_stats_.qkv_proj_ms : nullptr);
+        qkv = ops::linear_no_bias(normed, w.to_qkv_w);
+    }
 
     // 3. Reshape to q, k, v: each [B, heads, N, dim_head]
     // qkv: [B, N, 3*heads*dim_head] -> rearrange 'b n (qkv h d) -> qkv b h n d'
     int64_t B = qkv.size(0);
     int64_t N = qkv.size(1);
-    Tensor qkv_r = qkv.reshape({B, N, 3, (int64_t)heads, (int64_t)dim_head});
-    // [B, N, 3, H, D] -> permute to [3, B, H, N, D]
-    qkv_r = qkv_r.permute({2, 0, 3, 1, 4});
-    // Split into q, k, v
-    Tensor q = qkv_r.slice(0, 0, 1).squeeze(0).contiguous();  // [B, H, N, D]
-    Tensor k = qkv_r.slice(0, 1, 2).squeeze(0).contiguous();  // [B, H, N, D]
-    Tensor v = qkv_r.slice(0, 2, 3).squeeze(0).contiguous();  // [B, H, N, D]
+    Tensor q;
+    Tensor k;
+    Tensor v;
+    {
+        ProfileScope qkv_split_scope(profile_enabled ? &profile_stats_.qkv_split_ms : nullptr);
+        split_qkv_heads(qkv, heads, dim_head, q, k, v);
+    }
 
     // 4. Apply rotary embedding to q and k
-    ops::apply_rotary_emb(q, k, cos_freqs, sin_freqs);
+    {
+        ProfileScope rotary_scope(profile_enabled ? &profile_stats_.rotary_ms : nullptr);
+        ops::apply_rotary_emb(q, k, cos_freqs, sin_freqs);
+    }
 
     // 5. Scaled dot-product attention
     float attn_scale = 1.0f / std::sqrt((float)dim_head);
-    Tensor out = ops::scaled_dot_product_attention(q, k, v, attn_scale);
+    Tensor out;
+    {
+        ProfileScope attn_core_scope(profile_enabled ? &profile_stats_.attn_core_ms : nullptr);
+        out = ops::scaled_dot_product_attention(q, k, v, attn_scale);
+    }
     // out: [B, H, N, D]
 
     // 6. Gating
     // gates = sigmoid(linear(normed, to_gates_w, to_gates_b)) -> [B, N, heads]
-    Tensor gates = ops::linear_sigmoid(normed, w.to_gates_w, w.to_gates_b);
+    Tensor gates;
+    {
+        ProfileScope gate_proj_scope(profile_enabled ? &profile_stats_.gate_proj_ms : nullptr);
+        gates = ops::linear_sigmoid(normed, w.to_gates_w, w.to_gates_b);
+    }
 
-    // gates: [B, N, H] -> permute to [B, H, N, 1] for broadcasting with out [B, H, N, D]
-    gates = gates.permute({0, 2, 1}).unsqueeze(-1);  // [B, H, N, 1]
-
-    // 7. Apply gates
-    out = out * gates;  // [B, H, N, D]
-
-    // 8. Reshape to [B, N, dim_inner]
-    out = out.permute({0, 2, 1, 3}).contiguous();  // [B, N, H, D]
-    out = out.reshape({B, N, (int64_t)dim_inner});
+    // 7-8. Apply gates and merge heads directly to [B, N, dim_inner]
+    {
+        ProfileScope gate_merge_scope(profile_enabled ? &profile_stats_.gate_merge_ms : nullptr);
+        out = apply_gates_and_merge_heads(out, gates, heads, dim_head);
+    }
 
     // 9. Output projection
-    out = ops::linear_no_bias(out, w.to_out_w);  // [B, N, dim]
+    {
+        ProfileScope out_proj_scope(profile_enabled ? &profile_stats_.out_proj_ms : nullptr);
+        out = ops::linear_no_bias(out, w.to_out_w);  // [B, N, dim]
+    }
 
     return out;
 }
@@ -431,15 +597,26 @@ Tensor MelBandRoformer::apply_attention(const Tensor& x, const AttentionWeights&
 Tensor MelBandRoformer::apply_feedforward(const Tensor& x, const FeedForwardWeights& w) {
     // x: [B, N, dim]
     float scale = std::sqrt((float)cfg_.dim);
+    bool profile_enabled = (bool)profile_logger_;
 
     // 1. RMS Norm
-    Tensor h = ops::rms_norm(x, w.norm_gamma, scale);
+    Tensor h;
+    {
+        ProfileScope norm_scope(profile_enabled ? &profile_stats_.ff_norm_ms : nullptr);
+        h = ops::rms_norm(x, w.norm_gamma, scale);
+    }
 
     // 2. Fused Linear1 + GELU: [B, N, dim] -> [B, N, dim*4]
-    h = ops::linear_gelu(h, w.linear1_w, w.linear1_b);
+    {
+        ProfileScope linear1_scope(profile_enabled ? &profile_stats_.ff_linear1_ms : nullptr);
+        h = ops::linear_gelu(h, w.linear1_w, w.linear1_b);
+    }
 
     // 3. Linear2: [B, N, dim*4] -> [B, N, dim]
-    h = ops::linear(h, w.linear2_w, w.linear2_b);
+    {
+        ProfileScope linear2_scope(profile_enabled ? &profile_stats_.ff_linear2_ms : nullptr);
+        h = ops::linear(h, w.linear2_w, w.linear2_b);
+    }
 
     return h;
 }
@@ -460,11 +637,11 @@ Tensor MelBandRoformer::apply_transformer(const Tensor& x,
     for (int i = 0; i < depth; i++) {
         // Attention + residual
         Tensor attn_out = apply_attention(out, w.attn_layers[i], cos_freqs, sin_freqs);
-        out = out + attn_out;
+        out.add_(attn_out);
 
         // FeedForward + residual
         Tensor ff_out = apply_feedforward(out, w.ff_layers[i]);
-        out = out + ff_out;
+        out.add_(ff_out);
     }
 
     // Final RMS norm
@@ -563,6 +740,8 @@ Tensor MelBandRoformer::apply_mask_estimator(const Tensor& x,
 
 Tensor MelBandRoformer::forward(const Tensor& audio) {
     using Clock = std::chrono::high_resolution_clock;
+    bool profile_enabled = (bool)profile_logger_;
+    profile_stats_ = {};
     // audio: [B, channels, samples] or [B, samples]
     int audio_channels = cfg_.stereo ? 2 : 1;
     int num_stems = cfg_.num_stems;
@@ -599,8 +778,10 @@ Tensor MelBandRoformer::forward(const Tensor& audio) {
     Tensor stft_repr = ops::stft(audio_flat, cfg_.stft_n_fft, cfg_.stft_hop_length,
                                  cfg_.stft_win_length, stft_window_, true,
                                  cfg_.stft_normalized);
-    cudaDeviceSynchronize();
-    stft_ms += profile_elapsed_ms(stft_start, Clock::now());
+    if (profile_enabled) {
+        cudaDeviceSynchronize();
+        stft_ms += profile_elapsed_ms(stft_start, Clock::now());
+    }
 
     int64_t F = stft_repr.size(1);   // num frequency bins (n_fft/2 + 1)
     int64_t T = stft_repr.size(2);   // num time frames
@@ -634,15 +815,19 @@ Tensor MelBandRoformer::forward(const Tensor& audio) {
     // Python: x = rearrange(x, 'b f t c -> b t (f c)')
     x = x.permute({0, 2, 1, 3}).contiguous();  // [B, T, total_band_freqs, 2]
     x = x.reshape({batch, T, total_band_freqs * 2});
-    cudaDeviceSynchronize();
-    gather_fold_ms += profile_elapsed_ms(gather_fold_start, Clock::now());
+    if (profile_enabled) {
+        cudaDeviceSynchronize();
+        gather_fold_ms += profile_elapsed_ms(gather_fold_start, Clock::now());
+    }
     // x: [B, T, total_band_freqs * 2]
 
     // ---- 7. Band split ----
     auto band_split_start = Clock::now();
     x = apply_band_split(x);
-    cudaDeviceSynchronize();
-    band_split_ms += profile_elapsed_ms(band_split_start, Clock::now());
+    if (profile_enabled) {
+        cudaDeviceSynchronize();
+        band_split_ms += profile_elapsed_ms(band_split_start, Clock::now());
+    }
     // x: [B, T, num_bands, dim]
 
     // ---- 8. Transformer layers (depth iterations) ----
@@ -682,8 +867,10 @@ Tensor MelBandRoformer::forward(const Tensor& audio) {
         // Reshape back: [B*F, T, D] -> [B, F, T, D] -> [B, T, F, D]
         x = x.reshape({batch, (int64_t)num_bands, T, (int64_t)dim});
         x = x.permute({0, 2, 1, 3}).contiguous();  // [B, T, num_bands, dim]
-        cudaDeviceSynchronize();
-        time_transform_ms += profile_elapsed_ms(time_start, Clock::now());
+        if (profile_enabled) {
+            cudaDeviceSynchronize();
+            time_transform_ms += profile_elapsed_ms(time_start, Clock::now());
+        }
 
         // Freq attention: [B, T, F, D] -> [B*T, F, D]
         auto freq_start = Clock::now();
@@ -704,8 +891,10 @@ Tensor MelBandRoformer::forward(const Tensor& audio) {
 
         // Reshape back: [B*T, F, D] -> [B, T, F, D]
         x = x.reshape({batch, T, (int64_t)num_bands, (int64_t)dim});
-        cudaDeviceSynchronize();
-        freq_transform_ms += profile_elapsed_ms(freq_start, Clock::now());
+        if (profile_enabled) {
+            cudaDeviceSynchronize();
+            freq_transform_ms += profile_elapsed_ms(freq_start, Clock::now());
+        }
 
         // Store for skip connections
         if (cfg_.skip_connection) {
@@ -722,8 +911,10 @@ Tensor MelBandRoformer::forward(const Tensor& audio) {
         auto mask_start = Clock::now();
         Tensor mask = apply_mask_estimator(x, mask_estimators_[s]);
         // mask: [B, T, total_freq_complex]
-        cudaDeviceSynchronize();
-        mask_estimator_ms += profile_elapsed_ms(mask_start, Clock::now());
+        if (profile_enabled) {
+            cudaDeviceSynchronize();
+            mask_estimator_ms += profile_elapsed_ms(mask_start, Clock::now());
+        }
         stem_masks.push_back(mask);
     }
 
@@ -792,8 +983,10 @@ Tensor MelBandRoformer::forward(const Tensor& audio) {
     Tensor mask_flat = masks_averaged.reshape({spatial, 2});
     Tensor result_flat = ops::complex_mul(stft_flat, mask_flat);
     Tensor stft_result = result_flat.reshape({batch, (int64_t)num_stems, total_freq, T, 2});
-    cudaDeviceSynchronize();
-    mask_merge_ms += profile_elapsed_ms(merge_start, Clock::now());
+    if (profile_enabled) {
+        cudaDeviceSynchronize();
+        mask_merge_ms += profile_elapsed_ms(merge_start, Clock::now());
+    }
 
     // ---- 11. Prepare for iSTFT ----
     // Python: stft_repr = rearrange(stft_repr, 'b n (f s) t -> (b n s) f t', s=audio_channels)
@@ -823,8 +1016,10 @@ Tensor MelBandRoformer::forward(const Tensor& audio) {
     Tensor recon_audio = ops::istft(stft_result, cfg_.stft_n_fft, cfg_.stft_hop_length,
                                     cfg_.stft_win_length, stft_window_, istft_length,
                                     true, cfg_.stft_normalized);
-    cudaDeviceSynchronize();
-    istft_ms += profile_elapsed_ms(istft_start, Clock::now());
+    if (profile_enabled) {
+        cudaDeviceSynchronize();
+        istft_ms += profile_elapsed_ms(istft_start, Clock::now());
+    }
 
     int64_t out_length = recon_audio.size(1);
 
@@ -844,6 +1039,17 @@ Tensor MelBandRoformer::forward(const Tensor& audio) {
         profile_logger_("[基层][MBR] Band Split: " + profile_format_ms(band_split_ms));
         profile_logger_("[基层][MBR] Time Transformer: " + profile_format_ms(time_transform_ms));
         profile_logger_("[基层][MBR] Freq Transformer: " + profile_format_ms(freq_transform_ms));
+        profile_logger_("[基层][Attn] RMSNorm: " + profile_format_ms(profile_stats_.attn_norm_ms));
+        profile_logger_("[基层][Attn] QKV 投影: " + profile_format_ms(profile_stats_.qkv_proj_ms));
+        profile_logger_("[基层][Attn] QKV 拆头: " + profile_format_ms(profile_stats_.qkv_split_ms));
+        profile_logger_("[基层][Attn] Rotary: " + profile_format_ms(profile_stats_.rotary_ms));
+        profile_logger_("[基层][Attn] 注意力核心: " + profile_format_ms(profile_stats_.attn_core_ms));
+        profile_logger_("[基层][Attn] Gate 投影: " + profile_format_ms(profile_stats_.gate_proj_ms));
+        profile_logger_("[基层][Attn] Gate 合并: " + profile_format_ms(profile_stats_.gate_merge_ms));
+        profile_logger_("[基层][Attn] 输出投影: " + profile_format_ms(profile_stats_.out_proj_ms));
+        profile_logger_("[基层][FFN] RMSNorm: " + profile_format_ms(profile_stats_.ff_norm_ms));
+        profile_logger_("[基层][FFN] Linear1+GELU: " + profile_format_ms(profile_stats_.ff_linear1_ms));
+        profile_logger_("[基层][FFN] Linear2: " + profile_format_ms(profile_stats_.ff_linear2_ms));
         profile_logger_("[基层][MBR] Mask Estimator: " + profile_format_ms(mask_estimator_ms));
         profile_logger_("[基层][MBR] Mask Merge: " + profile_format_ms(mask_merge_ms));
         profile_logger_("[基层][MBR] iSTFT: " + profile_format_ms(istft_ms));

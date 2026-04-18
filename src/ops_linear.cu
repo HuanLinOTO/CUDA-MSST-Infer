@@ -37,6 +37,50 @@ static Tensor maybe_cast_back(const Tensor& result, DType orig) {
     return result;
 }
 
+static cublasStatus_t gemm_f32_fast(cublasHandle_t handle,
+                                    cublasOperation_t transa,
+                                    cublasOperation_t transb,
+                                    int m, int n, int k,
+                                    const float* alpha,
+                                    const float* A, int lda,
+                                    const float* B, int ldb,
+                                    const float* beta,
+                                    float* C, int ldc) {
+    return cublasGemmEx(handle,
+        transa, transb,
+        m, n, k,
+        alpha,
+        A, CUDA_R_32F, lda,
+        B, CUDA_R_32F, ldb,
+        beta,
+        C, CUDA_R_32F, ldc,
+        CUBLAS_COMPUTE_32F_FAST_TF32,
+        CUBLAS_GEMM_DEFAULT_TENSOR_OP);
+}
+
+static cublasStatus_t gemm_strided_batched_f32_fast(cublasHandle_t handle,
+                                                     cublasOperation_t transa,
+                                                     cublasOperation_t transb,
+                                                     int m, int n, int k,
+                                                     const float* alpha,
+                                                     const float* A, int lda, long long int strideA,
+                                                     const float* B, int ldb, long long int strideB,
+                                                     const float* beta,
+                                                     float* C, int ldc, long long int strideC,
+                                                     int batch_count) {
+    return cublasGemmStridedBatchedEx(handle,
+        transa, transb,
+        m, n, k,
+        alpha,
+        A, CUDA_R_32F, lda, strideA,
+        B, CUDA_R_32F, ldb, strideB,
+        beta,
+        C, CUDA_R_32F, ldc, strideC,
+        batch_count,
+        CUBLAS_COMPUTE_32F_FAST_TF32,
+        CUBLAS_GEMM_DEFAULT_TENSOR_OP);
+}
+
 // ---------------------------------------------------------------------------
 // CudaContext (singleton)
 // ---------------------------------------------------------------------------
@@ -270,7 +314,7 @@ Tensor linear(const Tensor& x, const Tensor& weight, const Tensor& bias) {
     // For row-major C[M,N] = X[M,K] * W^T[K,N]:
     //   We use: cublasSgemm(handle, CUBLAS_OP_T, CUBLAS_OP_N, N, M, K,
     //                       &alpha, W, K, X, K, &beta, C, N)
-    cublasStatus_t stat = cublasSgemm(handle,
+    cublasStatus_t stat = gemm_f32_fast(handle,
         CUBLAS_OP_T,   // transpose W (col-major [K,N] -> [N,K])
         CUBLAS_OP_N,   // no transpose X (col-major [K,M] = X^T, which is what we want)
         N, M, K,
@@ -363,7 +407,7 @@ Tensor linear_no_bias(const Tensor& x, const Tensor& weight) {
     int K = (int)in_features;
     int N = (int)out_features;
 
-    cublasStatus_t stat = cublasSgemm(handle,
+    cublasStatus_t stat = gemm_f32_fast(handle,
         CUBLAS_OP_T, CUBLAS_OP_N,
         N, M, K,
         &alpha,
@@ -431,7 +475,7 @@ Tensor matmul(const Tensor& a, const Tensor& b) {
         // Row-major C[M,N] = A[M,K] @ B[K,N]
         // cublas col-major: swap args
         //   cublasSgemm(handle, N_op, N_op, N, M, K, alpha, B, N, A, K, beta, C, N)
-        cublasStatus_t stat = cublasSgemm(handle,
+        cublasStatus_t stat = gemm_f32_fast(handle,
             CUBLAS_OP_N, CUBLAS_OP_N,
             (int)N, (int)M, (int)K,
             &alpha,
@@ -552,7 +596,7 @@ Tensor batched_matmul(const Tensor& a, const Tensor& b) {
     long long int strideB = (long long int)(K * N);
     long long int strideC = (long long int)(M * N);
 
-    cublasStatus_t stat = cublasSgemmStridedBatched(handle,
+    cublasStatus_t stat = gemm_strided_batched_f32_fast(handle,
         CUBLAS_OP_N, CUBLAS_OP_N,
         (int)N, (int)M, (int)K,
         &alpha,

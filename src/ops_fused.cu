@@ -247,14 +247,16 @@ static Tensor do_gemm(const Tensor& x, const Tensor& weight,
     cublasHandle_t handle = CudaContext::instance().cublas();
     float alpha = 1.0f, beta = 0.0f;
     
-    cublasSgemm(handle,
+    cublasGemmEx(handle,
         CUBLAS_OP_T, CUBLAS_OP_N,
         (int)out_features, (int)total_batch, (int)in_features,
         &alpha,
-        wf.data_f32(), (int)in_features,
-        xf.data_f32(), (int)in_features,
+        wf.data_f32(), CUDA_R_32F, (int)in_features,
+        xf.data_f32(), CUDA_R_32F, (int)in_features,
         &beta,
-        out.data_f32(), (int)out_features);
+        out.data_f32(), CUDA_R_32F, (int)out_features,
+        CUBLAS_COMPUTE_32F_FAST_TF32,
+        CUBLAS_GEMM_DEFAULT_TENSOR_OP);
     return out;
 }
 

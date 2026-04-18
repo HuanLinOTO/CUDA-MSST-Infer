@@ -132,6 +132,15 @@ Tensor scaled_dot_product_attention(const Tensor& q, const Tensor& k, const Tens
     Tensor qf = ensure_f32(q);   // [B, H, N,   D]
     Tensor kf = ensure_f32(k);   // [B, H, N_k, D]
     Tensor vf = ensure_f32(v);   // [B, H, N_k, D]
+    bool use_fp16_attention = g_quantize_fp16 && D <= 128;
+    Tensor qh;
+    Tensor kh;
+    Tensor vh;
+    if (use_fp16_attention) {
+        qh = qf.to_f16().contiguous();
+        kh = kf.to_f16().contiguous();
+        vh = vf.to_f16().contiguous();
+    }
 
     // ---- default scale ----
     if (scale == 0.0f) {
@@ -172,13 +181,27 @@ Tensor scaled_dot_product_attention(const Tensor& q, const Tensor& k, const Tens
             long long int strideB = static_cast<long long int>(N_k * D);
             long long int strideC = static_cast<long long int>(N * N_k);
 
-            cublasSgemmStridedBatched(handle,
-                CUBLAS_OP_T, CUBLAS_OP_N,
-                n, m, kk, &alpha,
-                kf.data_f32(), kk, strideB,
-                qf.data_f32(), kk, strideA,
-                &beta, scores.data_f32(), n, strideC,
-                static_cast<int>(BH));
+            if (use_fp16_attention) {
+                cublasGemmStridedBatchedEx(handle,
+                    CUBLAS_OP_T, CUBLAS_OP_N,
+                    n, m, kk, &alpha,
+                    kh.data_ptr(), CUDA_R_16F, kk, strideB,
+                    qh.data_ptr(), CUDA_R_16F, kk, strideA,
+                    &beta, scores.data_f32(), CUDA_R_32F, n, strideC,
+                    static_cast<int>(BH),
+                    CUBLAS_COMPUTE_32F,
+                    CUBLAS_GEMM_DEFAULT_TENSOR_OP);
+            } else {
+                cublasGemmStridedBatchedEx(handle,
+                    CUBLAS_OP_T, CUBLAS_OP_N,
+                    n, m, kk, &alpha,
+                    kf.data_f32(), CUDA_R_32F, kk, strideB,
+                    qf.data_f32(), CUDA_R_32F, kk, strideA,
+                    &beta, scores.data_f32(), CUDA_R_32F, n, strideC,
+                    static_cast<int>(BH),
+                    CUBLAS_COMPUTE_32F_FAST_TF32,
+                    CUBLAS_GEMM_DEFAULT_TENSOR_OP);
+            }
         }
 
         // Fused Scale + Softmax (2 memory passes instead of 5)
@@ -203,13 +226,27 @@ Tensor scaled_dot_product_attention(const Tensor& q, const Tensor& k, const Tens
             long long int strideB = static_cast<long long int>(N_k * D);
             long long int strideC = static_cast<long long int>(N * D);
 
-            cublasSgemmStridedBatched(handle,
-                CUBLAS_OP_N, CUBLAS_OP_N,
-                n, m, kk, &alpha,
-                vf.data_f32(), n, strideB,
-                scores.data_f32(), kk, strideA,
-                &beta, out.data_f32(), n, strideC,
-                static_cast<int>(BH));
+            if (use_fp16_attention) {
+                cublasGemmStridedBatchedEx(handle,
+                    CUBLAS_OP_N, CUBLAS_OP_N,
+                    n, m, kk, &alpha,
+                    vh.data_ptr(), CUDA_R_16F, n, strideB,
+                    scores.data_f32(), CUDA_R_32F, kk, strideA,
+                    &beta, out.data_f32(), CUDA_R_32F, n, strideC,
+                    static_cast<int>(BH),
+                    CUBLAS_COMPUTE_32F,
+                    CUBLAS_GEMM_DEFAULT_TENSOR_OP);
+            } else {
+                cublasGemmStridedBatchedEx(handle,
+                    CUBLAS_OP_N, CUBLAS_OP_N,
+                    n, m, kk, &alpha,
+                    vf.data_f32(), CUDA_R_32F, n, strideB,
+                    scores.data_f32(), CUDA_R_32F, kk, strideA,
+                    &beta, out.data_f32(), CUDA_R_32F, n, strideC,
+                    static_cast<int>(BH),
+                    CUBLAS_COMPUTE_32F_FAST_TF32,
+                    CUBLAS_GEMM_DEFAULT_TENSOR_OP);
+            }
         }
     }
 
