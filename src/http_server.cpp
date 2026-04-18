@@ -126,6 +126,8 @@ struct JobState {
     std::string model_name;
     std::string original_filename;
     std::string sanitized_base;
+    bool quantize_fp16 = false;
+    int chunk_batch_size = 0;
     std::string status = "排队中";
     std::string error;
     int progress = 0;
@@ -473,12 +475,14 @@ public:
     const fs::path& model_dir() const { return model_dir_; }
     const ServerOptions& options() const { return options_; }
 
-    LoadedModel& get_model(const std::string& relative_name) {
+    LoadedModel& get_model(const std::string& relative_name, bool quantize_fp16, LogCallback logger = nullptr) {
         fs::path resolved = resolve_model_path(relative_name);
-        std::string key = resolved.generic_string();
+        std::string key = resolved.generic_string() + (quantize_fp16 ? "|fp16" : "|fp32");
         if (!cached_model_ || cached_model_path_ != key) {
-            cached_model_ = std::make_unique<LoadedModel>(load_model(resolved.string(), options_.device, options_.quantize_fp16));
+            cached_model_ = std::make_unique<LoadedModel>(load_model(resolved.string(), options_.device, quantize_fp16, logger));
             cached_model_path_ = key;
+        } else if (logger) {
+            logger("[模型] 复用已缓存模型");
         }
         return *cached_model_;
     }
@@ -493,12 +497,15 @@ public:
         return candidate;
     }
 
-    std::shared_ptr<JobState> create_job(const std::string& model_name, float overlap, const UploadedFile& file) {
+    std::shared_ptr<JobState> create_job(const std::string& model_name, float overlap, bool quantize_fp16,
+                                         int chunk_batch_size, const UploadedFile& file) {
         auto job = std::make_shared<JobState>();
         job->id = make_job_id();
         job->model_name = model_name;
         job->original_filename = file.filename;
         job->sanitized_base = base_name_of(file.filename);
+        job->quantize_fp16 = quantize_fp16;
+        job->chunk_batch_size = chunk_batch_size;
         {
             std::lock_guard<std::mutex> lock(job->mutex);
             job->logs.push_back("任务已创建，等待进入推理队列");
@@ -527,6 +534,8 @@ public:
         json << "{";
         json << "\"id\":\"" << json_escape(job->id) << "\",";
         json << "\"model\":\"" << json_escape(job->model_name) << "\",";
+        json << "\"fp16\":" << (job->quantize_fp16 ? "true" : "false") << ",";
+        json << "\"chunk_batch_size\":" << job->chunk_batch_size << ",";
         json << "\"filename\":\"" << json_escape(job->original_filename) << "\",";
         json << "\"status\":\"" << json_escape(job->status) << "\",";
         json << "\"progress\":" << job->progress << ",";
@@ -632,7 +641,21 @@ private:
             {
                 std::lock_guard<std::mutex> infer_lock(infer_mutex_);
                 set_state(job, 25, "运行中", "[模型] 正在加载分离模型");
-                LoadedModel& model = get_model(job->model_name);
+                LoadedModel& model = get_model(
+                    job->model_name,
+                    job->quantize_fp16,
+                    [job](const std::string& line) {
+                        std::lock_guard<std::mutex> lock(job->mutex);
+                        job->logs.push_back(line);
+                    }
+                );
+                model.chunk_batch_size = job->chunk_batch_size > 0 ? job->chunk_batch_size : (std::max)(1, model.chunk_batch_size);
+                model.detailed_logger = nullptr;
+                {
+                    std::lock_guard<std::mutex> lock(job->mutex);
+                    job->logs.push_back(std::string("[配置] 精度模式: ") + (job->quantize_fp16 ? "FP16" : "FP32"));
+                    job->logs.push_back("[配置] 分片批大小: " + std::to_string(model.chunk_batch_size));
+                }
 
                 set_state(job, 40, "运行中", "[音频] 正在解析输入音频");
                 set_state(job, 55, "运行中", "[推理] 正在执行模型推理");
@@ -647,13 +670,24 @@ private:
                 );
 
                 set_state(job, 80, "运行中", "[输出] 正在整理输出轨道并补算 other");
+                auto collect_start = std::chrono::high_resolution_clock::now();
                 std::vector<OutputTrack> tracks = collect_output_tracks(model, result.audio, result.output);
+                {
+                    std::lock_guard<std::mutex> lock(job->mutex);
+                    job->logs.push_back("[耗时] 轨道整理: " + std::to_string((int)std::chrono::duration<double, std::milli>(std::chrono::high_resolution_clock::now() - collect_start).count()) + " ms");
+                }
+
+                auto encode_start = std::chrono::high_resolution_clock::now();
                 for (const auto& track : tracks) {
                     TrackAsset asset;
                     asset.name = track.name;
                     asset.derived = track.derived;
                     asset.wav_bytes = encode_wav_bytes(track.audio, model.sample_rate);
                     assets.push_back(std::move(asset));
+                }
+                {
+                    std::lock_guard<std::mutex> lock(job->mutex);
+                    job->logs.push_back("[耗时] WAV 编码: " + std::to_string((int)std::chrono::duration<double, std::milli>(std::chrono::high_resolution_clock::now() - encode_start).count()) + " ms");
                 }
             }
 
@@ -735,7 +769,10 @@ button:disabled{opacity:.6;cursor:wait}
     html << html_escape(state.options().host) << ':' << state.options().port;
     html << R"HTML(</div></div>
       <div class="stat"><strong>GPU Device</strong><div class="hint">CUDA )HTML";
-    html << state.options().device << (state.options().quantize_fp16 ? " - FP16" : " - FP32");
+    html << state.options().device << (state.options().quantize_fp16 ? " - 默认 FP16" : " - 默认 FP32");
+    html << R"HTML(</div></div>
+      <div class="stat"><strong>Chunk Batch</strong><div class="hint">)HTML";
+    html << (state.options().chunk_batch_size > 0 ? std::to_string(state.options().chunk_batch_size) : std::string("模型默认"));
     html << R"HTML(</div></div>
     </aside>
   </div>
@@ -760,6 +797,17 @@ button:disabled{opacity:.6;cursor:wait}
         <div class="field">
           <label>Overlap Override</label>
           <input id="overlap" name="overlap" type="number" step="0.01" placeholder="Leave blank for model default">
+        </div>
+        <div class="field">
+          <label>Precision</label>
+          <select id="fp16" name="fp16">
+            <option value="0">FP32</option>
+            <option value="1">FP16</option>
+          </select>
+        </div>
+        <div class="field">
+          <label>Chunk Batch Size</label>
+          <input id="chunk_batch_size" name="chunk_batch_size" type="number" min="1" step="1" placeholder="Leave blank for model default">
         </div>
         <button id="submit" type="submit">开始推理</button>
       </form>
@@ -944,11 +992,20 @@ static HttpResponse handle_create_job(ServerState& state, const HttpRequest& req
     if (!audio_file) return json_response(400, "{\"error\":\"Missing audio upload\"}");
 
     float overlap = state.options().overlap;
+    bool quantize_fp16 = state.options().quantize_fp16;
+    int chunk_batch_size = state.options().chunk_batch_size;
     if (form.fields.count("overlap") && !trim(form.fields["overlap"]).empty()) {
         overlap = std::stof(trim(form.fields["overlap"]));
     }
+    if (form.fields.count("fp16") && !trim(form.fields["fp16"]).empty()) {
+        std::string value = trim(form.fields["fp16"]);
+        quantize_fp16 = (value == "1" || value == "true" || value == "on");
+    }
+    if (form.fields.count("chunk_batch_size") && !trim(form.fields["chunk_batch_size"]).empty()) {
+        chunk_batch_size = (std::max)(1, std::stoi(trim(form.fields["chunk_batch_size"])));
+    }
 
-    auto job = state.create_job(form.fields["model"], overlap, *audio_file);
+    auto job = state.create_job(form.fields["model"], overlap, quantize_fp16, chunk_batch_size, *audio_file);
     return json_response(200, state.job_json(job));
 }
 

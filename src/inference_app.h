@@ -16,10 +16,12 @@ namespace cudasep::app {
 
 enum class ModelType { Unknown, MelBandRoformer, BSRoformer, MDX23C, HTDemucs };
 enum class ChunkMode { Generic, Demucs };
+using LogCallback = std::function<void(const std::string&)>;
 
 struct LoadedModel {
     std::string model_path;
     ModelType type = ModelType::Unknown;
+    LogCallback detailed_logger;
     ModelWeights weights;
     MelBandRoformer mbr;
     BSRoformer bsr;
@@ -29,6 +31,7 @@ struct LoadedModel {
     int sample_rate = 44100;
     int chunk_size = 0;
     int num_overlap = 4;
+    int chunk_batch_size = 1;
     ChunkMode chunk_mode = ChunkMode::Generic;
     bool quantize_fp16 = false;
     std::vector<std::string> stem_names;
@@ -49,11 +52,10 @@ struct OutputTrack {
     bool derived = false;
 };
 
-using LogCallback = std::function<void(const std::string&)>;
-
 const char* model_type_name(ModelType t);
 ModelType detect_model_type(const JsonValue& config);
-LoadedModel load_model(const std::string& model_path, int device, bool quantize_fp16);
+LoadedModel load_model(const std::string& model_path, int device, bool quantize_fp16,
+                       LogCallback logger = nullptr);
 InferenceResult run_inference(LoadedModel& model, const std::string& input_path, float overlap,
                               LogCallback logger = nullptr);
 InferenceResult run_inference(LoadedModel& model, const AudioData& audio, float overlap,

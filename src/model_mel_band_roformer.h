@@ -1,6 +1,7 @@
 #pragma once
 #include "tensor.h"
 #include "weights.h"
+#include <functional>
 #include <vector>
 #include <string>
 #include <unordered_map>
@@ -42,6 +43,7 @@ public:
 
     // Run inference: input [B, channels, samples], output [B, channels, samples] (or [B, num_stems, channels, samples])
     Tensor forward(const Tensor& audio);
+    void set_profile_logger(std::function<void(const std::string&)> logger) { profile_logger_ = std::move(logger); }
 
     const MBRConfig& config() const { return cfg_; }
 
@@ -58,6 +60,7 @@ private:
 
     // STFT window
     Tensor stft_window_;
+    std::function<void(const std::string&)> profile_logger_;
 
     // Rotary embeddings cache (keyed by seq_len)
     std::unordered_map<int, std::pair<Tensor, Tensor>> rotary_cache_;

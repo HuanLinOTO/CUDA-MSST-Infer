@@ -6,6 +6,8 @@
 #include "ops.h"
 #include <cufft.h>
 #include <cmath>
+#include <mutex>
+#include <unordered_map>
 
 #ifndef M_PI
 #define M_PI 3.14159265358979323846
@@ -25,6 +27,67 @@
 } while(0)
 
 namespace cudasep {
+
+namespace {
+
+struct FftPlanKey {
+    int n_fft = 0;
+    int batch = 0;
+    int type = 0;
+
+    bool operator==(const FftPlanKey& other) const {
+        return n_fft == other.n_fft && batch == other.batch && type == other.type;
+    }
+};
+
+struct FftPlanKeyHash {
+    size_t operator()(const FftPlanKey& key) const {
+        size_t h1 = std::hash<int>{}(key.n_fft);
+        size_t h2 = std::hash<int>{}(key.batch);
+        size_t h3 = std::hash<int>{}(key.type);
+        return h1 ^ (h2 << 1) ^ (h3 << 2);
+    }
+};
+
+static cufftHandle get_cached_fft_plan(int n_fft, int batch, cufftType type) {
+    static std::mutex plan_mutex;
+    static std::unordered_map<FftPlanKey, cufftHandle, FftPlanKeyHash> cache;
+
+    FftPlanKey key{n_fft, batch, (int)type};
+    std::lock_guard<std::mutex> lock(plan_mutex);
+    auto it = cache.find(key);
+    if (it != cache.end()) {
+        CUFFT_CHECK(cufftSetStream(it->second, CudaContext::instance().stream()));
+        return it->second;
+    }
+
+    cufftHandle plan;
+    CUFFT_CHECK(cufftPlan1d(&plan, n_fft, type, batch));
+    CUFFT_CHECK(cufftSetStream(plan, CudaContext::instance().stream()));
+    cache.emplace(key, plan);
+    return plan;
+}
+
+static void* get_fft_complex_buffer(size_t required_bytes) {
+    static std::mutex buffer_mutex;
+    static void* buffer = nullptr;
+    static size_t buffer_size = 0;
+
+    std::lock_guard<std::mutex> lock(buffer_mutex);
+    if (required_bytes <= buffer_size && buffer != nullptr) {
+        return buffer;
+    }
+    if (buffer != nullptr) {
+        cudaFree(buffer);
+        buffer = nullptr;
+        buffer_size = 0;
+    }
+    CUDA_CHECK(cudaMalloc(&buffer, required_bytes));
+    buffer_size = required_bytes;
+    return buffer;
+}
+
+}
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -271,14 +334,12 @@ Tensor stft(const Tensor& signal, int n_fft, int hop_length, int win_length,
 
     // Allocate complex output: [B*T, F] cufftComplex
     int64_t complex_elems = (int64_t)B * T * F;
-    cufftComplex* d_complex = nullptr;
-    CUDA_CHECK(cudaMalloc(&d_complex, complex_elems * sizeof(cufftComplex)));
+    cufftComplex* d_complex = static_cast<cufftComplex*>(
+        get_fft_complex_buffer((size_t)complex_elems * sizeof(cufftComplex)));
 
     {
-        cufftHandle plan;
-        CUFFT_CHECK(cufftPlan1d(&plan, n_fft, CUFFT_R2C, B * T));
+        cufftHandle plan = get_cached_fft_plan(n_fft, B * T, CUFFT_R2C);
         CUFFT_CHECK(cufftExecR2C(plan, frames.data_f32(), d_complex));
-        CUFFT_CHECK(cufftDestroy(plan));
     }
 
     // 5. Reshape: [B*T, F] complex -> [B, F, T, 2] float
@@ -290,8 +351,6 @@ Tensor stft(const Tensor& signal, int n_fft, int hop_length, int win_length,
             d_complex, output.data_f32(), B, F, T);
         CUDA_CHECK(cudaGetLastError());
     }
-
-    CUDA_CHECK(cudaFree(d_complex));
 
     // 6. Normalization
     if (normalized) {
@@ -334,8 +393,8 @@ Tensor istft(const Tensor& complex_spec, int n_fft, int hop_length, int win_leng
 
     // 1. Convert [B, F, T, 2] -> [B*T, F] cufftComplex
     int64_t complex_elems = (int64_t)B * F * T;
-    cufftComplex* d_complex = nullptr;
-    CUDA_CHECK(cudaMalloc(&d_complex, complex_elems * sizeof(cufftComplex)));
+    cufftComplex* d_complex = static_cast<cufftComplex*>(
+        get_fft_complex_buffer((size_t)complex_elems * sizeof(cufftComplex)));
 
     {
         int grid = (int)ceildiv(complex_elems, (int64_t)kBlockSize);
@@ -349,13 +408,9 @@ Tensor istft(const Tensor& complex_spec, int n_fft, int hop_length, int win_leng
     Tensor frames = Tensor::empty({(int64_t)B * T, (int64_t)n_fft}, DType::Float32);
 
     {
-        cufftHandle plan;
-        CUFFT_CHECK(cufftPlan1d(&plan, n_fft, CUFFT_C2R, B * T));
+        cufftHandle plan = get_cached_fft_plan(n_fft, B * T, CUFFT_C2R);
         CUFFT_CHECK(cufftExecC2R(plan, d_complex, frames.data_f32()));
-        CUFFT_CHECK(cufftDestroy(plan));
     }
-
-    CUDA_CHECK(cudaFree(d_complex));
 
     // cuFFT C2R output is unnormalized: divide by n_fft
     {

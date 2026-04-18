@@ -22,6 +22,8 @@ struct Args {
     bool list_stems = false;
     bool help = false;
     bool quantize_fp16 = false;
+    bool deep_profile = false;
+    int chunk_batch_size = 0;
     bool server_mode = false;
     std::string host = "127.0.0.1";
     int port = 8080;
@@ -49,6 +51,12 @@ static Args parse_args(int argc, char** argv) {
             args.list_stems = true;
         } else if (a == "--quantize" || a == "--fp16") {
             args.quantize_fp16 = true;
+        } else if (a == "--no-fp16" || a == "--fp32") {
+            args.quantize_fp16 = false;
+        } else if (a == "--deep-profile") {
+            args.deep_profile = true;
+        } else if (a == "--chunk-batch-size" && i + 1 < argc) {
+            args.chunk_batch_size = std::stoi(argv[++i]);
         } else if (a == "--serve") {
             args.server_mode = true;
         } else if (a == "--host" && i + 1 < argc) {
@@ -75,6 +83,9 @@ static void print_usage(const char* progname) {
               << "Common options:\n"
               << "  --device, -d <int>     CUDA device ID (default: 0)\n"
               << "  --quantize, --fp16     Enable FP16 mixed-precision GEMM\n"
+              << "  --no-fp16, --fp32      Disable FP16 mixed-precision GEMM\n"
+              << "  --chunk-batch-size <n> Override chunk inference batch size\n"
+              << "  --deep-profile         Print model-internal stage timings\n"
               << "  --help, -h             Show this help message\n\n"
               << "CLI options:\n"
               << "  --model, -m <path>     Path to .csm model weights file\n"
@@ -113,9 +124,16 @@ static int run_cli(const Args& args) {
         return 1;
     }
 
-    cudasep::app::LoadedModel model = cudasep::app::load_model(args.model_path, args.device, args.quantize_fp16);
-
     std::cout << "Loading model: " << args.model_path << std::endl;
+    cudasep::app::LogCallback cli_logger = [](const std::string& line) {
+        std::cout << "  " << line << std::endl;
+    };
+    cudasep::app::LoadedModel model = cudasep::app::load_model(args.model_path, args.device, args.quantize_fp16, cli_logger);
+    model.detailed_logger = args.deep_profile ? cli_logger : nullptr;
+    if (args.chunk_batch_size > 0) {
+        model.chunk_batch_size = args.chunk_batch_size;
+        cli_logger("[配置] 分片批大小覆盖: " + std::to_string(model.chunk_batch_size));
+    }
     std::cout << "  Model type: " << cudasep::app::model_type_name(model.type) << std::endl;
     std::cout << "  Sources: " << model.num_sources
               << ", Sample rate: " << model.sample_rate
@@ -136,7 +154,7 @@ static int run_cli(const Args& args) {
     }
 
     std::cout << "\nLoading audio: " << args.input_path << std::endl;
-    cudasep::app::InferenceResult result = cudasep::app::run_inference(model, args.input_path, args.overlap);
+    cudasep::app::InferenceResult result = cudasep::app::run_inference(model, args.input_path, args.overlap, cli_logger);
 
     std::cout << "  " << result.audio.channels << "ch, " << result.audio.sample_rate << " Hz, "
               << result.audio.num_samples << " samples ("
@@ -174,6 +192,7 @@ static int run_server(const Args& args) {
     options.device = args.device;
     options.overlap = args.overlap;
     options.quantize_fp16 = args.quantize_fp16;
+    options.chunk_batch_size = args.chunk_batch_size;
     options.max_upload_bytes = (size_t)std::max(1, args.max_upload_mb) * 1024ull * 1024ull;
     return cudasep::app::run_http_server(options);
 }

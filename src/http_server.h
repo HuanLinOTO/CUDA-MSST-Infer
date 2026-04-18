@@ -12,6 +12,7 @@ struct ServerOptions {
     int device = 0;
     float overlap = -1.0f;
     bool quantize_fp16 = false;
+    int chunk_batch_size = 0;
     size_t max_upload_bytes = 200 * 1024 * 1024;
 };
 
