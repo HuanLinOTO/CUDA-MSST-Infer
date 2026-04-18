@@ -275,13 +275,13 @@ AudioData load_wav(const std::string& path) {
 // WAV Writer
 // ============================================================================
 
-void save_wav(const std::string& path, const Tensor& samples, int sample_rate) {
+std::vector<uint8_t> encode_wav_bytes(const Tensor& samples, int sample_rate) {
     if (samples.ndim() != 2) {
-        throw std::runtime_error("save_wav: expected 2D tensor [channels, num_samples], got " +
+        throw std::runtime_error("encode_wav_bytes: expected 2D tensor [channels, num_samples], got " +
                                  std::to_string(samples.ndim()) + "D");
     }
     if (samples.dtype() != DType::Float32) {
-        throw std::runtime_error("save_wav: expected Float32 tensor");
+        throw std::runtime_error("encode_wav_bytes: expected Float32 tensor");
     }
 
     int channels = (int)samples.size(0);
@@ -298,36 +298,55 @@ void save_wav(const std::string& path, const Tensor& samples, int sample_rate) {
         }
     }
 
-    // --- Write WAV file ---
-    std::ofstream f(path, std::ios::binary);
-    if (!f.is_open()) {
-        throw std::runtime_error("Failed to open output WAV file: " + path);
-    }
-
     uint32_t data_size = (uint32_t)(channels * num_frames * sizeof(float));
     uint32_t fmt_chunk_size = 16;
     uint32_t file_size = 4 + (8 + fmt_chunk_size) + (8 + data_size); // WAVE + fmt chunk + data chunk
 
-    // RIFF header
-    write_tag(f, "RIFF");
-    write_u32(f, file_size);
-    write_tag(f, "WAVE");
+    std::vector<uint8_t> bytes;
+    bytes.reserve(44 + data_size);
 
-    // fmt chunk (IEEE float)
-    write_tag(f, "fmt ");
-    write_u32(f, fmt_chunk_size);
-    write_u16(f, 3);                                               // audio_format = IEEE float
-    write_u16(f, (uint16_t)channels);                              // num_channels
-    write_u32(f, (uint32_t)sample_rate);                           // sample_rate
-    write_u32(f, (uint32_t)(sample_rate * channels * sizeof(float))); // byte_rate
-    write_u16(f, (uint16_t)(channels * sizeof(float)));            // block_align
-    write_u16(f, 32);                                              // bits_per_sample
+    auto append_u16 = [&](uint16_t v) {
+        bytes.push_back((uint8_t)(v & 0xFF));
+        bytes.push_back((uint8_t)((v >> 8) & 0xFF));
+    };
+    auto append_u32 = [&](uint32_t v) {
+        bytes.push_back((uint8_t)(v & 0xFF));
+        bytes.push_back((uint8_t)((v >> 8) & 0xFF));
+        bytes.push_back((uint8_t)((v >> 16) & 0xFF));
+        bytes.push_back((uint8_t)((v >> 24) & 0xFF));
+    };
+    auto append_tag = [&](const char tag[4]) {
+        bytes.insert(bytes.end(), tag, tag + 4);
+    };
 
-    // data chunk
-    write_tag(f, "data");
-    write_u32(f, data_size);
-    f.write(reinterpret_cast<const char*>(interleaved.data()), data_size);
+    append_tag("RIFF");
+    append_u32(file_size);
+    append_tag("WAVE");
 
+    append_tag("fmt ");
+    append_u32(fmt_chunk_size);
+    append_u16(3);
+    append_u16((uint16_t)channels);
+    append_u32((uint32_t)sample_rate);
+    append_u32((uint32_t)(sample_rate * channels * sizeof(float)));
+    append_u16((uint16_t)(channels * sizeof(float)));
+    append_u16(32);
+
+    append_tag("data");
+    append_u32(data_size);
+
+    const uint8_t* raw = reinterpret_cast<const uint8_t*>(interleaved.data());
+    bytes.insert(bytes.end(), raw, raw + data_size);
+    return bytes;
+}
+
+void save_wav(const std::string& path, const Tensor& samples, int sample_rate) {
+    std::vector<uint8_t> bytes = encode_wav_bytes(samples, sample_rate);
+    std::ofstream f(path, std::ios::binary);
+    if (!f.is_open()) {
+        throw std::runtime_error("Failed to open output WAV file: " + path);
+    }
+    f.write(reinterpret_cast<const char*>(bytes.data()), (std::streamsize)bytes.size());
     f.close();
 }
 

@@ -21,7 +21,7 @@ set(CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS} -O3 --use_fast_math --expt-relaxed-con
 # Platform-specific compiler and linker flags
 if(MSVC)
     set(CMAKE_CXX_FLAGS_RELEASE "/O2 /DNDEBUG")
-    set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} /O2 /DNDEBUG")
+    set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} /O2 /DNDEBUG /utf-8")
 else()
     # Strip debug symbols in Release builds (saves 50-100 MB)
     set(CMAKE_EXE_LINKER_FLAGS_RELEASE "${CMAKE_EXE_LINKER_FLAGS_RELEASE} -s")
@@ -68,6 +68,8 @@ if(WIN32)
         ${CUDNN_LIB_DIR}/cudnn_adv64_9.lib
         ${CUDNN_LIB_DIR}/cudnn_graph64_9.lib
     )
+    set(PLATFORM_LIBS ws2_32)
+    file(GLOB CUDNN_RUNTIME_DLLS "${CUDNN_ROOT}/bin/cudnn*.dll")
 else()
     # Linux: find .so libs in CUDNN_LIB_DIR
     find_library(CUDNN_LIB cudnn PATHS ${CUDNN_LIB_DIR} NO_DEFAULT_PATH)
@@ -82,6 +84,7 @@ else()
         ${CUDNN_ADV_LIB}
         ${CUDNN_GRAPH_LIB}
     )
+    set(PLATFORM_LIBS)
 endif()
 
 target_link_libraries(cudasep_infer PRIVATE
@@ -90,12 +93,23 @@ target_link_libraries(cudasep_infer PRIVATE
     CUDA::cufft
     CUDA::cudart
     ${CUDNN_LIBS}
+    ${PLATFORM_LIBS}
 )
 
 target_include_directories(cudasep_infer PRIVATE
     ${CMAKE_SOURCE_DIR}/src
     ${CUDNN_INCLUDE_DIR}
 )
+
+if(WIN32 AND CUDNN_RUNTIME_DLLS)
+    add_custom_command(TARGET cudasep_infer POST_BUILD
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+            ${CUDNN_RUNTIME_DLLS}
+            $<TARGET_FILE_DIR:cudasep_infer>
+        COMMAND_EXPAND_LISTS
+        COMMENT "Copying cuDNN runtime DLLs"
+    )
+endif()
 
 # Optional Python bindings
 option(BUILD_PYTHON_BINDINGS "Build Python bindings via pybind11" OFF)
@@ -124,10 +138,21 @@ if(BUILD_PYTHON_BINDINGS)
         CUDA::cufft
         CUDA::cudart
         ${CUDNN_LIBS}
+        ${PLATFORM_LIBS}
     )
 
     target_include_directories(cudasep PRIVATE
         ${CMAKE_SOURCE_DIR}/src
         ${CUDNN_INCLUDE_DIR}
     )
+
+    if(WIN32 AND CUDNN_RUNTIME_DLLS)
+        add_custom_command(TARGET cudasep POST_BUILD
+            COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                ${CUDNN_RUNTIME_DLLS}
+                $<TARGET_FILE_DIR:cudasep>
+            COMMAND_EXPAND_LISTS
+            COMMENT "Copying cuDNN runtime DLLs"
+        )
+    endif()
 endif()

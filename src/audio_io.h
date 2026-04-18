@@ -1,6 +1,7 @@
 #pragma once
 #include "tensor.h"
 #include <string>
+#include <vector>
 
 namespace cudasep {
 
@@ -17,6 +18,9 @@ AudioData load_audio(const std::string& path);
 
 // Write audio to WAV file. samples: [channels, num_samples] Float32 (on GPU, will be copied to CPU).
 void save_wav(const std::string& path, const Tensor& samples, int sample_rate);
+
+// Encode audio to WAV bytes. samples: [channels, num_samples] Float32.
+std::vector<uint8_t> encode_wav_bytes(const Tensor& samples, int sample_rate);
 
 // Internal WAV reader
 AudioData load_wav(const std::string& path);

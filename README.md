@@ -88,7 +88,12 @@ cmake --build build -j$(nproc)
 
 # 重叠参数 (单位：秒，默认 2)
 ./cudasep_infer --model model.csm --input song.mp3 --output out/ --overlap 4
+
+# HTTP 服务器模式
+./cudasep_infer --serve --model-dir ./csm_models --host 127.0.0.1 --port 8080
 ```
+
+启动服务器模式后，在浏览器打开 `http://127.0.0.1:8080/`，即可上传音频、选择 `.csm` 模型，并在前端查看计时、进度、日志和全部输出轨道。若模型本身不包含 `other`，服务器会自动用原混音减去所有已分离轨道生成 `other`。
 
 ## 预转换权重
 
