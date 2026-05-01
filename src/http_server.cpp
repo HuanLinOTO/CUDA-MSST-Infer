@@ -2,6 +2,8 @@
 
 #include "audio_io.h"
 #include "inference_app.h"
+#include "memory_pool.h"
+#include "ops.h"
 
 #include <algorithm>
 #include <atomic>
@@ -127,6 +129,8 @@ struct JobState {
     std::string original_filename;
     std::string sanitized_base;
     bool quantize_fp16 = false;
+    bool enable_cuda_graph = true;
+    bool keep_model_loaded = true;
     int chunk_batch_size = 0;
     std::string status = "排队中";
     std::string error;
@@ -153,6 +157,37 @@ static std::string trim(std::string s) {
     size_t start = 0;
     while (start < s.size() && (s[start] == ' ' || s[start] == '\t')) start++;
     return s.substr(start);
+}
+
+static bool parse_toggle_value(std::string value) {
+    value = to_lower(trim(std::move(value)));
+    return value == "1" || value == "true" || value == "on" || value == "yes" ||
+           value == "enabled" || value == "mixed" || value == "keep";
+}
+
+static bool parse_precision_mode(std::string value, bool current) {
+    value = to_lower(trim(std::move(value)));
+    if (value.empty()) return current;
+    if (value == "native" || value == "model" || value == "source" ||
+        value == "0" || value == "false" || value == "off" || value == "fp32") {
+        return false;
+    }
+    if (value == "mixed" || value == "accelerated" || value == "1" ||
+        value == "true" || value == "on" || value == "fp16") {
+        return true;
+    }
+    return current;
+}
+
+static std::string precision_mode_title(bool mixed_precision) {
+    return mixed_precision ? "混精加速" : "遵循模型文件";
+}
+
+static std::string precision_mode_description(bool mixed_precision) {
+    if (mixed_precision) {
+        return "如果 .csm 里仍有 FP32 线性权重，加载后会转成 FP16，并启用 attention 混精路径。";
+    }
+    return "按 .csm 文件里的原始 dtype 推理，不额外把 FP32 线性权重转成 FP16。";
 }
 
 static std::string html_escape(const std::string& input) {
@@ -404,7 +439,7 @@ static ByteRange parse_range_header(const std::string& header_value, size_t tota
 static MultipartForm parse_multipart(const HttpRequest& request) {
     std::string content_type = header_value(request, "content-type");
     size_t boundary_pos = content_type.find("boundary=");
-    if (boundary_pos == std::string::npos) throw std::runtime_error("Missing multipart boundary");
+    if (boundary_pos == std::string::npos) throw std::runtime_error("缺少 multipart boundary");
     std::string boundary = content_type.substr(boundary_pos + 9);
     if (!boundary.empty() && boundary.front() == '"' && boundary.back() == '"') {
         boundary = boundary.substr(1, boundary.size() - 2);
@@ -492,12 +527,13 @@ public:
         std::string candidate_str = candidate.generic_string();
         std::string base_str = model_dir_.generic_string();
         if (candidate_str.rfind(base_str, 0) != 0 || !fs::exists(candidate) || candidate.extension() != ".csm") {
-            throw std::runtime_error("Invalid model path");
+            throw std::runtime_error("模型路径无效");
         }
         return candidate;
     }
 
     std::shared_ptr<JobState> create_job(const std::string& model_name, float overlap, bool quantize_fp16,
+                                         bool enable_cuda_graph, bool keep_model_loaded,
                                          int chunk_batch_size, const UploadedFile& file) {
         auto job = std::make_shared<JobState>();
         job->id = make_job_id();
@@ -505,6 +541,8 @@ public:
         job->original_filename = file.filename;
         job->sanitized_base = base_name_of(file.filename);
         job->quantize_fp16 = quantize_fp16;
+        job->enable_cuda_graph = enable_cuda_graph;
+        job->keep_model_loaded = keep_model_loaded;
         job->chunk_batch_size = chunk_batch_size;
         {
             std::lock_guard<std::mutex> lock(job->mutex);
@@ -535,6 +573,9 @@ public:
         json << "\"id\":\"" << json_escape(job->id) << "\",";
         json << "\"model\":\"" << json_escape(job->model_name) << "\",";
         json << "\"fp16\":" << (job->quantize_fp16 ? "true" : "false") << ",";
+        json << "\"precision_mode\":\"" << (job->quantize_fp16 ? "mixed" : "native") << "\",";
+        json << "\"cuda_graph\":" << (job->enable_cuda_graph ? "true" : "false") << ",";
+        json << "\"keep_model_loaded\":" << (job->keep_model_loaded ? "true" : "false") << ",";
         json << "\"chunk_batch_size\":" << job->chunk_batch_size << ",";
         json << "\"filename\":\"" << json_escape(job->original_filename) << "\",";
         json << "\"status\":\"" << json_escape(job->status) << "\",";
@@ -595,6 +636,18 @@ public:
     }
 
 private:
+    void trim_runtime_caches() {
+        cudasep::clear_attention_graph_cache();
+        CudaMemoryPool::instance().trim_cached_memory();
+    }
+
+    void unload_cached_model_and_trim() {
+        CudaContext::instance().sync();
+        cached_model_.reset();
+        cached_model_path_.clear();
+        trim_runtime_caches();
+    }
+
     void set_state(const std::shared_ptr<JobState>& job, int progress, const std::string& status, const std::string& log_line) {
         std::lock_guard<std::mutex> lock(job->mutex);
         if (!job->started) {
@@ -640,6 +693,10 @@ private:
             std::vector<TrackAsset> assets;
             {
                 std::lock_guard<std::mutex> infer_lock(infer_mutex_);
+                cudasep::g_enable_cuda_graph_attention = job->enable_cuda_graph;
+                if (!job->enable_cuda_graph) {
+                    trim_runtime_caches();
+                }
                 set_state(job, 25, "运行中", "[模型] 正在加载分离模型");
                 LoadedModel& model = get_model(
                     job->model_name,
@@ -649,11 +706,15 @@ private:
                         job->logs.push_back(line);
                     }
                 );
+                cudasep::g_quantize_fp16 = job->quantize_fp16;
                 model.chunk_batch_size = job->chunk_batch_size > 0 ? job->chunk_batch_size : (std::max)(1, model.chunk_batch_size);
                 model.detailed_logger = nullptr;
                 {
                     std::lock_guard<std::mutex> lock(job->mutex);
-                    job->logs.push_back(std::string("[配置] 精度模式: ") + (job->quantize_fp16 ? "FP16" : "FP32"));
+                    job->logs.push_back("[配置] 精度策略: " + precision_mode_title(job->quantize_fp16));
+                    job->logs.push_back("[配置] 精度说明: " + precision_mode_description(job->quantize_fp16));
+                    job->logs.push_back(std::string("[配置] CUDA Graph: ") + (job->enable_cuda_graph ? "开启（更快，但更占显存）" : "关闭（降低常驻显存）"));
+                    job->logs.push_back(std::string("[配置] 模型保持加载: ") + (job->keep_model_loaded ? "开启（任务后继续驻留显存）" : "关闭（任务后释放模型与缓存）"));
                     job->logs.push_back("[配置] 分片批大小: " + std::to_string(model.chunk_batch_size));
                 }
 
@@ -689,6 +750,12 @@ private:
                     std::lock_guard<std::mutex> lock(job->mutex);
                     job->logs.push_back("[耗时] WAV 编码: " + std::to_string((int)std::chrono::duration<double, std::milli>(std::chrono::high_resolution_clock::now() - encode_start).count()) + " ms");
                 }
+
+                if (!job->keep_model_loaded) {
+                    unload_cached_model_and_trim();
+                    std::lock_guard<std::mutex> lock(job->mutex);
+                    job->logs.push_back("[模型] 已按请求释放缓存模型、CUDA Graph 和空闲显存缓存");
+                }
             }
 
             if (!upload_path.empty()) {
@@ -697,6 +764,10 @@ private:
             }
             finish_success(job, std::move(assets));
         } catch (const std::exception& e) {
+            if (!job->keep_model_loaded) {
+                std::lock_guard<std::mutex> infer_lock(infer_mutex_);
+                unload_cached_model_and_trim();
+            }
             if (!upload_path.empty()) {
                 std::error_code ec;
                 fs::remove(upload_path, ec);
@@ -717,13 +788,17 @@ private:
 };
 
 static std::string render_index(const ServerState& state) {
-    std::ostringstream html;
-    html << R"HTML(<!doctype html>
+        const bool default_mixed_precision = state.options().quantize_fp16;
+        const bool default_cuda_graph = state.options().enable_cuda_graph;
+        const bool default_keep_model_loaded = state.options().keep_model_loaded;
+
+        std::ostringstream html;
+        html << R"HTML(<!doctype html>
 <html>
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>CudaInfer Server</title>
+<title>CudaInfer 音源分离工作台</title>
 <style>
 :root{--bg:#f5efe5;--ink:#1b2630;--muted:#5d6c78;--card:#fffaf4;--accent:#d16b3f;--accent2:#264653;--line:#dfd2c4}
 *{box-sizing:border-box}
@@ -735,6 +810,7 @@ body{margin:0;font-family:'Segoe UI',Arial,sans-serif;background:radial-gradient
 .stats{padding:24px;display:grid;gap:12px;align-content:start}.stat{padding:14px 16px;border-radius:16px;background:#fff;border:1px solid var(--line)}
 .grid{display:grid;grid-template-columns:1fr 1fr;gap:18px;margin-top:18px}.section{padding:22px}.section h2{margin:0 0 14px;font-size:18px}
 .field{display:grid;gap:8px;margin-bottom:14px}.field label{font-weight:700;font-size:13px;text-transform:uppercase;letter-spacing:.08em;color:var(--muted)}
+.field .hint{margin-top:-2px}
 input,select,button{width:100%;padding:13px 14px;border-radius:14px;border:1px solid #d7c8b7;background:#fff;font-size:14px}
 button{background:linear-gradient(135deg,var(--accent),#e08f52);color:#fff;border:none;font-weight:800;cursor:pointer}
 button:disabled{opacity:.6;cursor:wait}
@@ -756,74 +832,102 @@ button:disabled{opacity:.6;cursor:wait}
 </head>
 <body>
 <div class="shell">
-  <div class="hero">
-    <section class="panel lead">
-      <h1>CudaInfer Web Test Bench</h1>
-      <p>上传音频后，前端会立刻开始计时，持续显示推理进度、阶段日志和分片日志，并在完成后直接展示全部输出轨道。如果模型本身没有 <code>other</code>，服务器会自动用 <code>原混音 - 所有已分离轨道之和</code> 补出一条 <code>other</code>。</p>
-    </section>
-    <aside class="panel stats">
-      <div class="stat"><strong>Model Dir</strong><div class="hint">)HTML";
-    html << html_escape(state.model_dir().generic_string());
-    html << R"HTML(</div></div>
-      <div class="stat"><strong>HTTP</strong><div class="hint">)HTML";
-    html << html_escape(state.options().host) << ':' << state.options().port;
-    html << R"HTML(</div></div>
-      <div class="stat"><strong>GPU Device</strong><div class="hint">CUDA )HTML";
-    html << state.options().device << (state.options().quantize_fp16 ? " - 默认 FP16" : " - 默认 FP32");
-    html << R"HTML(</div></div>
-      <div class="stat"><strong>Chunk Batch</strong><div class="hint">)HTML";
-    html << (state.options().chunk_batch_size > 0 ? std::to_string(state.options().chunk_batch_size) : std::string("模型默认"));
-    html << R"HTML(</div></div>
-    </aside>
-  </div>
-  <div class="grid">
-    <section class="panel section">
-      <h2>Start Inference</h2>
-      <form id="infer-form">
-        <div class="field">
-          <label>Model</label>
-          <select id="model" name="model">)HTML";
+    <div class="hero">
+        <section class="panel lead">
+            <h1>CudaInfer 音源分离工作台</h1>
+            <p>上传音频后，页面会立即开始计时，持续显示推理进度、阶段日志和分片日志，并在完成后直接展示全部输出轨道。如果模型本身没有 <code>other</code>，服务器会自动用 <code>原混音 - 所有已分离轨道之和</code> 补出一条 <code>other</code>。</p>
+        </section>
+        <aside class="panel stats">
+            <div class="stat"><strong>模型目录</strong><div class="hint">)HTML";
+        html << html_escape(state.model_dir().generic_string());
+        html << R"HTML(</div></div>
+            <div class="stat"><strong>服务地址</strong><div class="hint">)HTML";
+        html << html_escape(state.options().host) << ':' << state.options().port;
+        html << R"HTML(</div></div>
+            <div class="stat"><strong>CUDA 设备</strong><div class="hint">GPU )HTML";
+        html << state.options().device;
+        html << R"HTML(</div></div>
+            <div class="stat"><strong>默认精度策略</strong><div class="hint">)HTML";
+        html << html_escape(precision_mode_title(default_mixed_precision)) << " · " << html_escape(precision_mode_description(default_mixed_precision));
+        html << R"HTML(</div></div>
+            <div class="stat"><strong>默认 CUDA Graph</strong><div class="hint">)HTML";
+        html << (default_cuda_graph ? "开启：更快，但更占显存" : "关闭：不保留额外 graph 工作区");
+        html << R"HTML(</div></div>
+            <div class="stat"><strong>默认模型保持加载</strong><div class="hint">)HTML";
+        html << (default_keep_model_loaded ? "开启：任务后继续驻留显存" : "关闭：任务后释放模型与缓存");
+        html << R"HTML(</div></div>
+            <div class="stat"><strong>默认分片批大小</strong><div class="hint">)HTML";
+        html << (state.options().chunk_batch_size > 0 ? std::to_string(state.options().chunk_batch_size) : std::string("模型默认"));
+        html << R"HTML(</div></div>
+        </aside>
+    </div>
+    <div class="grid">
+        <section class="panel section">
+            <h2>创建推理任务</h2>
+            <form id="infer-form">
+                <div class="field">
+                    <label>模型</label>
+                    <select id="model" name="model">)HTML";
 
-    for (const auto& model : state.models()) {
-        html << "<option value=\"" << html_escape(model.relative_name) << "\">" << html_escape(model.relative_name) << "</option>";
-    }
+        for (const auto& model : state.models()) {
+                html << "<option value=\"" << html_escape(model.relative_name) << "\">" << html_escape(model.relative_name) << "</option>";
+        }
 
-    html << R"HTML(</select>
-        </div>
-        <div class="field">
-          <label>Audio File</label>
-          <input id="audio" name="audio" type="file" accept="audio/*" required>
-        </div>
-        <div class="field">
-          <label>Overlap Override</label>
-          <input id="overlap" name="overlap" type="number" step="0.01" placeholder="Leave blank for model default">
-        </div>
-        <div class="field">
-          <label>Precision</label>
-          <select id="fp16" name="fp16">
-            <option value="0">FP32</option>
-            <option value="1">FP16</option>
-          </select>
-        </div>
-        <div class="field">
-          <label>Chunk Batch Size</label>
-          <input id="chunk_batch_size" name="chunk_batch_size" type="number" min="1" step="1" placeholder="Leave blank for model default">
-        </div>
-        <button id="submit" type="submit">开始推理</button>
-      </form>
-      <div class="meta">
-        <div class="pill" id="status-pill">空闲</div>
-        <div class="pill" id="timer-pill">00:00</div>
-        <div class="pill" id="progress-pill">0%</div>
-      </div>
-      <div style="margin-top:14px" class="progress"><div id="progress-bar"></div></div>
-      <div class="logs" id="logs"></div>
-    </section>
-    <section class="panel section">
-      <h2>Output Tracks</h2>
-      <div id="tracks" class="tracks"><div class="hint">还没有输出结果。任务完成后，这里会直接出现所有轨道的试听和下载按钮。</div></div>
-    </section>
-  </div>
+        html << R"HTML(</select>
+                </div>
+                <div class="field">
+                    <label>音频文件</label>
+                    <input id="audio" name="audio" type="file" accept="audio/*" required>
+                </div>
+                <div class="field">
+                    <label>Overlap 覆盖值</label>
+                    <input id="overlap" name="overlap" type="number" step="0.01" placeholder="留空则使用模型默认值">
+                    <div class="hint">支持覆盖分片 overlap；一般不填即可。</div>
+                </div>
+                <div class="field">
+                    <label>精度 / 加速策略</label>
+                    <select id="precision_mode" name="precision_mode">)HTML";
+        html << "<option value=\"native\"" << (default_mixed_precision ? "" : " selected") << ">遵循模型文件原始 dtype</option>";
+        html << "<option value=\"mixed\"" << (default_mixed_precision ? " selected" : "") << ">启用混精加速</option>";
+        html << R"HTML(</select>
+                    <div class="hint">这不是“强制 FP32 / 强制 FP16”。关闭时按 <code>.csm</code> 文件里的原始 dtype 运行；开启时，如果模型里仍有 FP32 线性权重，加载后会转为 FP16，并启用 attention 混精路径。</div>
+                </div>
+                <div class="field">
+                    <label>CUDA Graph</label>
+                    <select id="cuda_graph" name="cuda_graph">)HTML";
+        html << "<option value=\"0\"" << (default_cuda_graph ? "" : " selected") << ">关闭</option>";
+        html << "<option value=\"1\"" << (default_cuda_graph ? " selected" : "") << ">开启</option>";
+        html << R"HTML(</select>
+                    <div class="hint">只影响 attention 的 CUDA Graph 路径。开启后通常更快，但会显著增加常驻显存占用。</div>
+                </div>
+                <div class="field">
+                    <label>模型保持加载</label>
+                    <select id="keep_model_loaded" name="keep_model_loaded">)HTML";
+        html << "<option value=\"0\"" << (default_keep_model_loaded ? "" : " selected") << ">任务后释放模型与缓存</option>";
+        html << "<option value=\"1\"" << (default_keep_model_loaded ? " selected" : "") << ">任务后继续驻留显存</option>";
+        html << R"HTML(</select>
+                    <div class="hint">关闭后，任务结束会释放缓存模型、CUDA Graph 和内存池空闲块，显存更容易回落；开启后，同一模型后续任务会更快启动。</div>
+                </div>
+                <div class="field">
+                    <label>分片批大小</label>
+                    <input id="chunk_batch_size" name="chunk_batch_size" type="number" min="1" step="1" placeholder="留空则使用模型默认值">
+                    <div class="hint">仅覆盖分片推理时的 batch 大小。</div>
+                </div>
+                <button id="submit" type="submit">开始推理</button>
+            </form>
+            <div class="meta">
+                <div class="pill" id="status-pill">空闲</div>
+                <div class="pill" id="timer-pill">00:00</div>
+                <div class="pill" id="progress-pill">0%</div>
+            </div>
+            <div style="margin-top:14px" class="progress"><div id="progress-bar"></div></div>
+            <div class="logs" id="logs"></div>
+        </section>
+        <section class="panel section">
+            <h2>输出轨道</h2>
+            <div id="tracks" class="tracks"><div class="hint">还没有输出结果。任务完成后，这里会直接出现所有轨道的试听和下载按钮。</div></div>
+        </section>
+    </div>
 </div>
 <script>
 const form = document.getElementById('infer-form');
@@ -839,124 +943,124 @@ let poller = null;
 let startedAt = 0;
 
 function fmt(ms) {
-  const s = Math.floor(ms / 1000);
-  const m = Math.floor(s / 60);
-  const r = s % 60;
-  return String(m).padStart(2, '0') + ':' + String(r).padStart(2, '0');
+    const s = Math.floor(ms / 1000);
+    const m = Math.floor(s / 60);
+    const r = s % 60;
+    return String(m).padStart(2, '0') + ':' + String(r).padStart(2, '0');
 }
 
 function setState(status, progress) {
-  statusPill.textContent = status;
-  progressPill.textContent = progress + '%';
-  progressBar.style.width = progress + '%';
+    statusPill.textContent = status;
+    progressPill.textContent = progress + '%';
+    progressBar.style.width = progress + '%';
 }
 
 function classifyLog(line) {
-  if (line.includes('失败') || line.includes('error') || line.includes('Error')) return 'log-error';
-  if (line.includes('完成') || line.includes('就绪')) return 'log-ok';
-  if (line.includes('分片')) return 'log-chunk';
-  if (line.startsWith('[') || line.startsWith('-')) return 'log-stage';
-  return 'log-info';
+    if (line.includes('失败') || line.includes('error') || line.includes('Error')) return 'log-error';
+    if (line.includes('完成') || line.includes('就绪')) return 'log-ok';
+    if (line.includes('分片')) return 'log-chunk';
+    if (line.startsWith('[') || line.startsWith('-')) return 'log-stage';
+    return 'log-info';
 }
 
 function setLogs(lines) {
-  const list = lines && lines.length ? lines : ['等待任务日志...'];
-  logs.innerHTML = list.map(line => '<div class="log-line ' + classifyLog(line) + '">' + line.replaceAll('&', '&amp;').replaceAll('<', '&lt;').replaceAll('>', '&gt;') + '</div>').join('');
-  logs.scrollTop = logs.scrollHeight;
+    const list = lines && lines.length ? lines : ['等待任务日志...'];
+    logs.innerHTML = list.map(line => '<div class="log-line ' + classifyLog(line) + '">' + line.replaceAll('&', '&amp;').replaceAll('<', '&lt;').replaceAll('>', '&gt;') + '</div>').join('');
+    logs.scrollTop = logs.scrollHeight;
 }
 
 function renderTracks(data) {
-  if (!data.tracks || !data.tracks.length) {
-    tracks.innerHTML = '<div class="hint">任务完成了，但没有返回任何轨道。</div>';
-    return;
-  }
-  tracks.innerHTML = '';
-  for (const track of data.tracks) {
-    const card = document.createElement('div');
-    card.className = 'track';
-    card.innerHTML = '<h3><span>' + track.name + '</span>' + (track.derived ? '<span class="tag">derived other</span>' : '') + '</h3>' +
-      '<audio controls preload="none" src="' + track.url + '"></audio>' +
-      '<a href="' + track.url + '" download>下载 WAV</a>';
-    tracks.appendChild(card);
-  }
+    if (!data.tracks || !data.tracks.length) {
+        tracks.innerHTML = '<div class="hint">任务完成了，但没有返回任何轨道。</div>';
+        return;
+    }
+    tracks.innerHTML = '';
+    for (const track of data.tracks) {
+        const card = document.createElement('div');
+        card.className = 'track';
+        card.innerHTML = '<h3><span>' + track.name + '</span>' + (track.derived ? '<span class="tag">补算 other</span>' : '') + '</h3>' +
+            '<audio controls preload="none" src="' + track.url + '"></audio>' +
+            '<a href="' + track.url + '" download>下载 WAV</a>';
+        tracks.appendChild(card);
+    }
 }
 
 function startTimer() {
-  startedAt = Date.now();
-  clearInterval(timer);
-  timer = setInterval(() => {
-    timerPill.textContent = fmt(Date.now() - startedAt);
-  }, 250);
+    startedAt = Date.now();
+    clearInterval(timer);
+    timer = setInterval(() => {
+        timerPill.textContent = fmt(Date.now() - startedAt);
+    }, 250);
 }
 
 function stopTimer() {
-  clearInterval(timer);
-  timer = null;
+    clearInterval(timer);
+    timer = null;
 }
 
 async function pollJob(id) {
-  clearInterval(poller);
-  poller = setInterval(async () => {
-    try {
-      const res = await fetch('/api/jobs/' + id);
-      const data = await res.json();
-      setState(data.status, data.progress || 0);
-      setLogs(data.logs || []);
-      if (data.elapsed_ms != null) {
-        timerPill.textContent = fmt(data.elapsed_ms);
-      }
-      if (data.status === '已完成') {
-        stopTimer();
-        clearInterval(poller);
-        submit.disabled = false;
-        submit.textContent = '开始推理';
-        renderTracks(data);
-      } else if (data.status === '失败') {
-        stopTimer();
-        clearInterval(poller);
-        submit.disabled = false;
-        submit.textContent = '开始推理';
-        tracks.innerHTML = '<div class="hint">' + (data.error || '推理失败') + '</div>';
-      }
-    } catch (err) {
-      stopTimer();
-      clearInterval(poller);
-      submit.disabled = false;
-      submit.textContent = '开始推理';
-      setLogs(['[轮询] 获取任务状态失败: ' + err.message]);
-    }
-  }, 700);
+    clearInterval(poller);
+    poller = setInterval(async () => {
+        try {
+            const res = await fetch('/api/jobs/' + id);
+            const data = await res.json();
+            setState(data.status, data.progress || 0);
+            setLogs(data.logs || []);
+            if (data.elapsed_ms != null) {
+                timerPill.textContent = fmt(data.elapsed_ms);
+            }
+            if (data.status === '已完成') {
+                stopTimer();
+                clearInterval(poller);
+                submit.disabled = false;
+                submit.textContent = '开始推理';
+                renderTracks(data);
+            } else if (data.status === '失败') {
+                stopTimer();
+                clearInterval(poller);
+                submit.disabled = false;
+                submit.textContent = '开始推理';
+                tracks.innerHTML = '<div class="hint">' + (data.error || '推理失败') + '</div>';
+            }
+        } catch (err) {
+            stopTimer();
+            clearInterval(poller);
+            submit.disabled = false;
+            submit.textContent = '开始推理';
+            setLogs(['[轮询] 获取任务状态失败: ' + err.message]);
+        }
+    }, 700);
 }
 
 form.addEventListener('submit', async (e) => {
-  e.preventDefault();
-  const fd = new FormData(form);
-  if (!fd.get('audio') || !fd.get('model')) return;
-  submit.disabled = true;
-  submit.textContent = '上传中...';
-  tracks.innerHTML = '<div class="hint">正在等待输出轨道...</div>';
-  setLogs(['[准备] 正在上传音频并创建任务...']);
-  setState('上传中', 2);
-  startTimer();
-  try {
-    const res = await fetch('/api/jobs', { method: 'POST', body: fd });
-    const text = await res.text();
-    let data = {};
-    try { data = JSON.parse(text); } catch (_) {}
-    if (!res.ok) {
-      throw new Error(data.error || text || '请求失败');
+    e.preventDefault();
+    const fd = new FormData(form);
+    if (!fd.get('audio') || !fd.get('model')) return;
+    submit.disabled = true;
+    submit.textContent = '上传中...';
+    tracks.innerHTML = '<div class="hint">正在等待输出轨道...</div>';
+    setLogs(['[准备] 正在上传音频并创建任务...']);
+    setState('上传中', 2);
+    startTimer();
+    try {
+        const res = await fetch('/api/jobs', { method: 'POST', body: fd });
+        const text = await res.text();
+        let data = {};
+        try { data = JSON.parse(text); } catch (_) {}
+        if (!res.ok) {
+            throw new Error(data.error || text || '请求失败');
+        }
+        submit.textContent = '推理中...';
+        setState(data.status || '排队中', data.progress || 5);
+        setLogs(data.logs || ['[队列] 任务已进入等待队列']);
+        pollJob(data.id);
+    } catch (err) {
+        stopTimer();
+        submit.disabled = false;
+        submit.textContent = '开始推理';
+        setState('失败', 0);
+        setLogs(['[请求] 创建任务失败: ' + err.message]);
     }
-    submit.textContent = '推理中...';
-    setState(data.status || '排队中', data.progress || 5);
-    setLogs(data.logs || ['[队列] 任务已进入等待队列']);
-    pollJob(data.id);
-  } catch (err) {
-    stopTimer();
-    submit.disabled = false;
-    submit.textContent = '开始推理';
-    setState('失败', 0);
-    setLogs(['[请求] 创建任务失败: ' + err.message]);
-}
 });
 
 setLogs(['[空闲] 请选择模型并上传音频文件']);
@@ -964,7 +1068,7 @@ setLogs(['[空闲] 请选择模型并上传音频文件']);
 </body>
 </html>)HTML";
 
-    return html.str();
+        return html.str();
 }
 
 static HttpResponse handle_models(const ServerState& state) {
@@ -980,7 +1084,7 @@ static HttpResponse handle_models(const ServerState& state) {
 
 static HttpResponse handle_create_job(ServerState& state, const HttpRequest& request) {
     MultipartForm form = parse_multipart(request);
-    if (!form.fields.count("model")) return json_response(400, "{\"error\":\"Missing model field\"}");
+    if (!form.fields.count("model")) return json_response(400, "{\"error\":\"缺少模型字段\"}");
 
     const UploadedFile* audio_file = nullptr;
     for (const auto& file : form.files) {
@@ -989,23 +1093,34 @@ static HttpResponse handle_create_job(ServerState& state, const HttpRequest& req
             break;
         }
     }
-    if (!audio_file) return json_response(400, "{\"error\":\"Missing audio upload\"}");
+    if (!audio_file) return json_response(400, "{\"error\":\"缺少音频上传文件\"}");
 
     float overlap = state.options().overlap;
     bool quantize_fp16 = state.options().quantize_fp16;
+    bool enable_cuda_graph = state.options().enable_cuda_graph;
+    bool keep_model_loaded = state.options().keep_model_loaded;
     int chunk_batch_size = state.options().chunk_batch_size;
     if (form.fields.count("overlap") && !trim(form.fields["overlap"]).empty()) {
         overlap = std::stof(trim(form.fields["overlap"]));
     }
-    if (form.fields.count("fp16") && !trim(form.fields["fp16"]).empty()) {
-        std::string value = trim(form.fields["fp16"]);
-        quantize_fp16 = (value == "1" || value == "true" || value == "on");
+    if (form.fields.count("precision_mode") && !trim(form.fields["precision_mode"]).empty()) {
+        quantize_fp16 = parse_precision_mode(form.fields["precision_mode"], quantize_fp16);
+    } else if (form.fields.count("fp16") && !trim(form.fields["fp16"]).empty()) {
+        quantize_fp16 = parse_toggle_value(form.fields["fp16"]);
+    }
+    if (form.fields.count("cuda_graph") && !trim(form.fields["cuda_graph"]).empty()) {
+        enable_cuda_graph = parse_toggle_value(form.fields["cuda_graph"]);
+    }
+    if (form.fields.count("keep_model_loaded") && !trim(form.fields["keep_model_loaded"]).empty()) {
+        keep_model_loaded = parse_toggle_value(form.fields["keep_model_loaded"]);
     }
     if (form.fields.count("chunk_batch_size") && !trim(form.fields["chunk_batch_size"]).empty()) {
         chunk_batch_size = (std::max)(1, std::stoi(trim(form.fields["chunk_batch_size"])));
     }
 
-    auto job = state.create_job(form.fields["model"], overlap, quantize_fp16, chunk_batch_size, *audio_file);
+    auto job = state.create_job(form.fields["model"], overlap, quantize_fp16,
+                                enable_cuda_graph, keep_model_loaded,
+                                chunk_batch_size, *audio_file);
     return json_response(200, state.job_json(job));
 }
 
@@ -1069,7 +1184,7 @@ static void handle_client(SocketHandle client_sock, ServerState& state, size_t m
         HttpResponse response = dispatch(state, request);
         send_response(client.sock, response);
     } catch (const std::exception& e) {
-        send_response(client.sock, text_response(500, std::string("Server error: ") + e.what(), "text/plain; charset=utf-8"));
+        send_response(client.sock, text_response(500, std::string("服务器错误: ") + e.what(), "text/plain; charset=utf-8"));
     }
 }
 

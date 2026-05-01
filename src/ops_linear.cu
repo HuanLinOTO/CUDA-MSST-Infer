@@ -143,6 +143,7 @@ __global__ void add_bias_kernel(float* __restrict__ out,
 //
 // Equivalent to nn.Linear: out = x @ W^T + b
 // ---------------------------------------------------------------------------
+bool g_enable_cuda_graph_attention = true;
 
 namespace ops {
 

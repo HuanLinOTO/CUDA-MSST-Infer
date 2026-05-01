@@ -8,6 +8,8 @@ namespace cudasep {
 
 // Global FP16 quantization flag for GEMM operations
 extern bool g_quantize_fp16;
+extern bool g_enable_cuda_graph_attention;
+void clear_attention_graph_cache();
 
 // Global context (cuBLAS/cuFFT/cuDNN handles + CUDA stream)
 class CudaContext {

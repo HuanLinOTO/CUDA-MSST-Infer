@@ -56,7 +56,7 @@ public:
         cudaError_t err = cudaMalloc(&ptr, alloc_size);
         if (err != cudaSuccess) {
             // Try to free some cached memory and retry
-            release_cached_memory();
+            release_cached_memory_locked();
             err = cudaMalloc(&ptr, alloc_size);
             if (err != cudaSuccess) {
                 throw std::runtime_error(
@@ -96,23 +96,15 @@ public:
     }
 
     // Release all cached (unused) memory back to CUDA
-    void release_cached_memory() {
-        // NOTE: must be called with mutex held or externally synchronized
-        size_t freed = 0;
-        for (auto& [size, blocks] : free_blocks_) {
-            for (void* ptr : blocks) {
-                cudaFree(ptr);
-                freed += size;
-            }
-        }
-        free_blocks_.clear();
-        stats_.total_freed += freed;
+    void trim_cached_memory() {
+        std::lock_guard<std::mutex> lock(mutex_);
+        release_cached_memory_locked();
     }
 
     // Release ALL memory (active + cached)
     void release_all() {
         std::lock_guard<std::mutex> lock(mutex_);
-        release_cached_memory();
+        release_cached_memory_locked();
         for (auto& [ptr, size] : active_blocks_) {
             cudaFree(ptr);
             stats_.total_freed += size;
@@ -160,6 +152,18 @@ public:
 
 private:
     CudaMemoryPool() = default;
+
+    void release_cached_memory_locked() {
+        size_t freed = 0;
+        for (auto& [size, blocks] : free_blocks_) {
+            for (void* ptr : blocks) {
+                cudaFree(ptr);
+                freed += size;
+            }
+        }
+        free_blocks_.clear();
+        stats_.total_freed += freed;
+    }
 
     // Round up to allocation granularity
     // Small: round to 512 bytes

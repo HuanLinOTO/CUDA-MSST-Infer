@@ -231,11 +231,19 @@ struct AttentionGraphCache {
     bool initialized = false;
 };
 
-static std::shared_ptr<AttentionGraphCache> get_attention_graph_cache(const AttentionGraphKey& key) {
+static std::mutex& attention_graph_cache_mutex() {
     static std::mutex cache_mutex;
-    static std::unordered_map<AttentionGraphKey, std::shared_ptr<AttentionGraphCache>, AttentionGraphKeyHash> caches;
+    return cache_mutex;
+}
 
-    std::lock_guard<std::mutex> lock(cache_mutex);
+static std::unordered_map<AttentionGraphKey, std::shared_ptr<AttentionGraphCache>, AttentionGraphKeyHash>& attention_graph_caches() {
+    static std::unordered_map<AttentionGraphKey, std::shared_ptr<AttentionGraphCache>, AttentionGraphKeyHash> caches;
+    return caches;
+}
+
+static std::shared_ptr<AttentionGraphCache> get_attention_graph_cache(const AttentionGraphKey& key) {
+    std::lock_guard<std::mutex> lock(attention_graph_cache_mutex());
+    auto& caches = attention_graph_caches();
     auto it = caches.find(key);
     if (it != caches.end()) {
         return it->second;
@@ -324,6 +332,11 @@ static bool initialize_attention_graph(AttentionGraphCache& cache) {
     return true;
 }
 
+void clear_attention_graph_cache() {
+    std::lock_guard<std::mutex> lock(attention_graph_cache_mutex());
+    attention_graph_caches().clear();
+}
+
 static bool try_run_attention_graph(const Tensor& q,
                                     const Tensor& k,
                                     const Tensor& v,
@@ -331,6 +344,9 @@ static bool try_run_attention_graph(const Tensor& q,
                                     bool use_fp16_value_gemm,
                                     DType orig_dtype,
                                     Tensor& result) {
+    if (!g_enable_cuda_graph_attention) {
+        return false;
+    }
     if (!is_f32_contiguous(q) || !is_f32_contiguous(k) || !is_f32_contiguous(v)) {
         return false;
     }
