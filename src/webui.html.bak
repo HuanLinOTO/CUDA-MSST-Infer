@@ -1,0 +1,271 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>CudaInfer 音源分离工作台</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Fira+Code:wght@400;500;600;700&family=Fira+Sans:wght@300;400;500;600;700&display=swap" rel="stylesheet">
+<style>
+:root{--bg:#0F172A;--ink:#F8FAFC;--muted:#94A3B8;--card:#1E293B;--accent:#22C55E;--accent2:#334155;--line:#334155;--surface:#1E293B;--border:#334155}
+*{box-sizing:border-box}
+body{margin:0;font-family:'Fira Sans',sans-serif;background:linear-gradient(135deg,#0F172A 0%,#1E293B 100%);color:var(--ink);line-height:1.6;font-size:16px}
+code,pre,.log-line{font-family:'Fira Code',monospace}
+.shell{max-width:1100px;margin:0 auto;padding:28px 20px 40px}
+.hero{display:grid;grid-template-columns:1.2fr .8fr;gap:18px}
+.panel{background:rgba(30,41,59,.92);backdrop-filter:blur(8px);border:1px solid rgba(51,65,85,.5);border-radius:16px;box-shadow:0 20px 50px rgba(0,0,0,.3);transition:transform 200ms ease,box-shadow 200ms ease}
+.panel:hover{transform:translateY(-2px);box-shadow:0 24px 60px rgba(0,0,0,.4)}
+.lead{padding:28px}.lead h1{margin:0 0 12px;font-size:38px;line-height:1.02}.lead p{margin:0;color:var(--muted);font-size:15px;line-height:1.6}
+.stats{padding:24px;display:grid;gap:12px;align-content:start}.stat{padding:14px 16px;border-radius:16px;background:#0F172A;border:1px solid var(--border)}
+.grid{display:grid;grid-template-columns:1fr 1fr;gap:18px;margin-top:18px}.section{padding:22px}.section h2{margin:0 0 14px;font-size:18px}
+.field{display:grid;gap:8px;margin-bottom:14px}.field label{font-weight:700;font-size:13px;text-transform:uppercase;letter-spacing:.08em;color:var(--muted)}
+.field .hint{margin-top:-2px}
+input,select{width:100%;padding:13px 14px;border-radius:12px;border:1px solid var(--border);background:#0F172A;color:var(--ink);font-size:14px;transition:border-color 200ms ease,box-shadow 200ms ease,background-color 200ms ease}
+input:focus,select:focus{outline:none;border-color:var(--accent);box-shadow:0 0 0 3px rgba(34,197,94,.2)}
+input:hover,select:hover{border-color:#475569}
+button{background:linear-gradient(135deg,var(--accent),#16A34A);color:#fff;border:none;font-weight:600;cursor:pointer;transition:all 200ms ease;padding:13px 14px;border-radius:12px;font-size:14px;width:100%}
+button:hover{transform:translateY(-1px);box-shadow:0 4px 12px rgba(34,197,94,.3)}
+button:disabled{opacity:.6;cursor:not-allowed;transform:none;box-shadow:none}
+button:active{transform:translateY(0)}
+.progress{height:12px;background:#1E293B;border-radius:999px;overflow:hidden;border:1px solid var(--border);position:relative}
+.progress>div{height:100%;width:0;background:linear-gradient(90deg,var(--accent),#16A34A);transition:width .35s ease;position:relative}
+.progress>div::after{content:'';position:absolute;top:0;left:0;right:0;bottom:0;background:linear-gradient(90deg,transparent,rgba(255,255,255,.2),transparent);animation:shimmer 2s infinite}
+@keyframes shimmer{0%{transform:translateX(-100%)}100%{transform:translateX(100%)}}
+.meta{display:flex;flex-wrap:wrap;gap:10px;margin:14px 0 0}.pill{padding:8px 12px;border-radius:999px;background:#0F172A;border:1px solid var(--border);font-size:13px;color:var(--ink);transition:all 200ms ease}
+.pill.loading{animation:pulse 2s infinite}
+@keyframes pulse{0%,100%{opacity:1}50%{opacity:.7}}
+.logs{margin-top:14px;background:#0F172A;color:#e8f0f4;border-radius:16px;padding:14px;height:260px;overflow:auto;font:12px/1.55 'Fira Code',monospace;display:grid;gap:8px}
+.log-line{padding:8px 10px;border-radius:10px;white-space:pre-wrap;word-break:break-word;border:1px solid rgba(255,255,255,.06)}
+.log-info{background:rgba(38,70,83,.45);border-color:rgba(120,180,200,.25)}
+.log-stage{background:rgba(209,107,63,.16);border-color:rgba(240,180,120,.25);color:#ffe4c7}
+.log-chunk{background:rgba(79,109,122,.22);border-color:rgba(160,220,255,.18);color:#d7f0ff}
+.log-ok{background:rgba(46,125,90,.24);border-color:rgba(120,230,170,.18);color:#d7ffe9}
+.log-warn{background:rgba(180,120,20,.18);border-color:rgba(255,220,120,.2);color:#fff0bf}
+.log-error{background:rgba(140,48,48,.28);border-color:rgba(255,120,120,.25);color:#ffd8d8}
+.tracks{display:grid;gap:14px}.track{padding:14px;border:1px solid var(--border);border-radius:16px;background:#1E293B;transition:border-color 200ms ease,transform 200ms ease}.track:hover{border-color:#475569;transform:translateY(-2px)}.track h3{display:flex;justify-content:space-between;gap:8px;margin:0 0 10px;font-size:16px}
+a{color:var(--accent);text-decoration:none;cursor:pointer;transition:color 200ms ease}
+a:hover{color:#16A34A;text-decoration:underline}
+.track a{display:inline-block;margin-top:8px;padding:8px 16px;background:rgba(34,197,94,.1);border:1px solid rgba(34,197,94,.3);border-radius:8px;font-size:13px;transition:all 200ms ease}
+.track a:hover{background:rgba(34,197,94,.2);transform:translateY(-1px)}
+@media (max-width:1200px){.shell{padding:20px 16px 32px}}
+@media (max-width:900px){.hero,.grid{grid-template-columns:1fr}.lead h1{font-size:28px}.shell{padding:16px 12px 24px}}
+@media (max-width:600px){.lead h1{font-size:24px}.panel{border-radius:12px}.field{margin-bottom:12px}input,select{padding:12px 12px}button{padding:12px 12px}.logs{height:200px}}
+@media (prefers-reduced-motion:reduce){*{animation-duration:0.01ms!important;animation-iteration-count:1!important;transition-duration:0.01ms!important}}
+</style>
+</head>
+<body>
+<div class="shell">
+    <div class="hero">
+        <section class="panel lead">
+            <h1>CudaInfer 音源分离工作台</h1>
+            <p>上传音频后，页面会立即开始计时，持续显示推理进度、阶段日志和分片日志，并在完成后直接展示全部输出轨道。如果模型本身没有 <code>other</code>，服务器会自动用 <code>原混音 - 所有已分离轨道之和</code> 补出一条 <code>other</code>。</p>
+        </section>
+        <aside class="panel stats">
+            <div class="stat"><strong>模型目录</strong><div class="hint">{{MODEL_DIR}}</div></div>
+            <div class="stat"><strong>服务地址</strong><div class="hint">{{HOST_PORT}}</div></div>
+            <div class="stat"><strong>CUDA 设备</strong><div class="hint">GPU {{DEVICE}}</div></div>
+            <div class="stat"><strong>默认精度策略</strong><div class="hint">{{PRECISION_TITLE}} · {{PRECISION_DESC}}</div></div>
+            <div class="stat"><strong>默认 CUDA Graph</strong><div class="hint">{{CUDA_GRAPH}}</div></div>
+            <div class="stat"><strong>默认模型保持加载</strong><div class="hint">{{KEEP_MODEL}}</div></div>
+            <div class="stat"><strong>默认分片批大小</strong><div class="hint">{{CHUNK_BATCH}}</div></div>
+        </aside>
+    </div>
+    <div class="grid">
+        <section class="panel section">
+            <h2>创建推理任务</h2>
+            <form id="infer-form">
+                <div class="field">
+                    <label for="model">模型</label>
+                    <select id="model" name="model">{{MODEL_OPTIONS}}</select>
+                </div>
+                <div class="field">
+                    <label for="audio">音频文件</label>
+                    <input id="audio" name="audio" type="file" accept="audio/*" required>
+                </div>
+                <div class="field">
+                    <label for="overlap">Overlap 覆盖值</label>
+                    <input id="overlap" name="overlap" type="number" step="0.01" placeholder="留空则使用模型默认值">
+                    <div class="hint">支持覆盖分片 overlap；一般不填即可。</div>
+                </div>
+                <div class="field">
+                    <label for="precision_mode">精度 / 加速策略</label>
+                    <select id="precision_mode" name="precision_mode">{{PRECISION_OPTIONS}}</select>
+                    <div class="hint">这不是"强制 FP32 / 强制 FP16"。关闭时按 <code>.csm</code> 文件里的原始 dtype 运行；开启时，如果模型里仍有 FP32 线性权重，加载后会转为 FP16，并启用 attention 混精路径。</div>
+                </div>
+                <div class="field">
+                    <label for="cuda_graph">CUDA Graph</label>
+                    <select id="cuda_graph" name="cuda_graph">{{CUDA_GRAPH_OPTIONS}}</select>
+                    <div class="hint">只影响 attention 的 CUDA Graph 路径。开启后通常更快，但会显著增加常驻显存占用。</div>
+                </div>
+                <div class="field">
+                    <label for="keep_model_loaded">模型保持加载</label>
+                    <select id="keep_model_loaded" name="keep_model_loaded">{{KEEP_MODEL_OPTIONS}}</select>
+                    <div class="hint">关闭后，任务结束会释放缓存模型、CUDA Graph 和内存池空闲块，显存更容易回落；开启后，同一模型后续任务会更快启动。</div>
+                </div>
+                <div class="field">
+                    <label for="chunk_batch_size">分片批大小</label>
+                    <input id="chunk_batch_size" name="chunk_batch_size" type="number" min="1" step="1" placeholder="留空则使用模型默认值">
+                    <div class="hint">仅覆盖分片推理时的 batch 大小。</div>
+                </div>
+                <button id="submit" type="submit">开始推理</button>
+            </form>
+            <div class="meta">
+                <div class="pill" id="status-pill">空闲</div>
+                <div class="pill" id="timer-pill">00:00</div>
+                <div class="pill" id="progress-pill">0%</div>
+            </div>
+            <div style="margin-top:14px" class="progress"><div id="progress-bar"></div></div>
+            <div class="logs" id="logs"></div>
+        </section>
+        <section class="panel section">
+            <h2>输出轨道</h2>
+            <div id="tracks" class="tracks"><div class="hint">还没有输出结果。任务完成后，这里会直接出现所有轨道的试听和下载按钮。</div></div>
+        </section>
+    </div>
+</div>
+<script>
+const form = document.getElementById('infer-form');
+const submit = document.getElementById('submit');
+const logs = document.getElementById('logs');
+const tracks = document.getElementById('tracks');
+const statusPill = document.getElementById('status-pill');
+const timerPill = document.getElementById('timer-pill');
+const progressPill = document.getElementById('progress-pill');
+const progressBar = document.getElementById('progress-bar');
+let timer = null;
+let poller = null;
+let startedAt = 0;
+
+function fmt(ms) {
+    const s = Math.floor(ms / 1000);
+    const m = Math.floor(s / 60);
+    const r = s % 60;
+    return String(m).padStart(2, '0') + ':' + String(r).padStart(2, '0');
+}
+
+function setState(status, progress) {
+    statusPill.textContent = status;
+    progressPill.textContent = progress + '%';
+    progressBar.style.width = progress + '%';
+    
+    // Add loading animation for active states
+    if (status === '运行中' || status === '上传中' || status === '排队中') {
+        statusPill.classList.add('loading');
+    } else {
+        statusPill.classList.remove('loading');
+    }
+}
+
+function classifyLog(line) {
+    if (line.includes('失败') || line.includes('error') || line.includes('Error')) return 'log-error';
+    if (line.includes('完成') || line.includes('就绪')) return 'log-ok';
+    if (line.includes('分片')) return 'log-chunk';
+    if (line.startsWith('[') || line.startsWith('-')) return 'log-stage';
+    return 'log-info';
+}
+
+function setLogs(lines) {
+    const list = lines && lines.length ? lines : ['等待任务日志...'];
+    logs.innerHTML = list.map(line => '<div class="log-line ' + classifyLog(line) + '">' + line.replaceAll('&', '&amp;').replaceAll('<', '&lt;').replaceAll('>', '&gt;') + '</div>').join('');
+    logs.scrollTop = logs.scrollHeight;
+}
+
+function renderTracks(data) {
+    if (!data.tracks || !data.tracks.length) {
+        tracks.innerHTML = '<div class="hint">任务完成了，但没有返回任何轨道。</div>';
+        return;
+    }
+    tracks.innerHTML = '';
+    for (const track of data.tracks) {
+        const card = document.createElement('div');
+        card.className = 'track';
+        card.innerHTML = '<h3><span>' + track.name + '</span>' + (track.derived ? '<span class="tag">补算 other</span>' : '') + '</h3>' +
+            '<audio controls preload="none" src="' + track.url + '"></audio>' +
+            '<a href="' + track.url + '" download>下载 WAV</a>';
+        tracks.appendChild(card);
+    }
+}
+
+function startTimer() {
+    startedAt = Date.now();
+    clearInterval(timer);
+    timer = setInterval(() => {
+        timerPill.textContent = fmt(Date.now() - startedAt);
+    }, 250);
+}
+
+function stopTimer() {
+    clearInterval(timer);
+    timer = null;
+}
+
+async function pollJob(id) {
+    clearInterval(poller);
+    poller = setInterval(async () => {
+        try {
+            const res = await fetch('/api/jobs/' + id);
+            const data = await res.json();
+            setState(data.status, data.progress || 0);
+            setLogs(data.logs || []);
+            if (data.elapsed_ms != null) {
+                timerPill.textContent = fmt(data.elapsed_ms);
+            }
+            if (data.status === '已完成') {
+                stopTimer();
+                clearInterval(poller);
+                submit.disabled = false;
+                submit.textContent = '开始推理';
+                renderTracks(data);
+            } else if (data.status === '失败') {
+                stopTimer();
+                clearInterval(poller);
+                submit.disabled = false;
+                submit.textContent = '开始推理';
+                tracks.innerHTML = '<div class="hint">' + (data.error || '推理失败') + '</div>';
+            }
+        } catch (err) {
+            stopTimer();
+            clearInterval(poller);
+            submit.disabled = false;
+            submit.textContent = '开始推理';
+            setLogs(['[轮询] 获取任务状态失败: ' + err.message]);
+        }
+    }, 700);
+}
+
+form.addEventListener('submit', async (e) => {
+    e.preventDefault();
+    const fd = new FormData(form);
+    if (!fd.get('audio') || !fd.get('model')) return;
+    submit.disabled = true;
+    submit.textContent = '上传中...';
+    tracks.innerHTML = '<div class="hint">正在等待输出轨道...</div>';
+    setLogs(['[准备] 正在上传音频并创建任务...']);
+    setState('上传中', 2);
+    startTimer();
+    try {
+        const res = await fetch('/api/jobs', { method: 'POST', body: fd });
+        const text = await res.text();
+        let data = {};
+        try { data = JSON.parse(text); } catch (_) {}
+        if (!res.ok) {
+            throw new Error(data.error || text || '请求失败');
+        }
+        submit.textContent = '推理中...';
+        setState(data.status || '排队中', data.progress || 5);
+        setLogs(data.logs || ['[队列] 任务已进入等待队列']);
+        pollJob(data.id);
+    } catch (err) {
+        stopTimer();
+        submit.disabled = false;
+        submit.textContent = '开始推理';
+        setState('失败', 0);
+        setLogs(['[请求] 创建任务失败: ' + err.message]);
+    }
+});
+
+setLogs(['[空闲] 请选择模型并上传音频文件']);
+</script>
+</body>
+</html>

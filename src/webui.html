@@ -1,0 +1,565 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>CudaInfer - Audio Source Separation</title>
+<style>
+*,*::before,*::after{box-sizing:border-box;margin:0;padding:0}
+:root{
+  --bg:#0a0e17;--bg2:#111827;--bg3:#1e293b;--bg4:#0f172a;
+  --border:#1e293b;--border2:#334155;
+  --text:#f8fafc;--text2:#cbd5e1;--text3:#64748b;
+  --accent:#3b82f6;--accent-dim:rgba(59,130,246,.12);
+  --green:#22c55e;--green-dim:rgba(34,197,94,.12);
+  --amber:#f59e0b;--amber-dim:rgba(245,158,11,.12);
+  --red:#ef4444;--red-dim:rgba(239,68,68,.12);
+  --cyan:#06b6d4;--cyan-dim:rgba(6,182,212,.12);
+  --purple:#a78bfa;--purple-dim:rgba(167,139,250,.12);
+  --radius:12px;--radius-sm:8px;
+  --shadow:0 4px 24px rgba(0,0,0,.35);
+  --font:-apple-system,BlinkMacSystemFont,'Segoe UI','Noto Sans SC',sans-serif;
+  --mono:'Cascadia Code','Fira Code','JetBrains Mono','Consolas',monospace;
+}
+html{font-size:15px}
+body{
+  font-family:var(--font);background:var(--bg);color:var(--text);
+  line-height:1.6;min-height:100vh;
+  background-image:radial-gradient(ellipse at 20% 50%,rgba(59,130,246,.04) 0%,transparent 60%),
+                   radial-gradient(ellipse at 80% 20%,rgba(167,139,250,.03) 0%,transparent 50%);
+}
+
+/* ===== Scrollbar ===== */
+::-webkit-scrollbar{width:6px;height:6px}
+::-webkit-scrollbar-track{background:transparent}
+::-webkit-scrollbar-thumb{background:var(--border2);border-radius:3px}
+::-webkit-scrollbar-thumb:hover{background:var(--text3)}
+
+/* ===== Top Bar ===== */
+.topbar{
+  display:flex;align-items:center;gap:16px;padding:14px 24px;
+  background:rgba(17,24,39,.85);backdrop-filter:blur(12px);
+  border-bottom:1px solid var(--border);position:sticky;top:0;z-index:100;
+}
+.topbar-logo{display:flex;align-items:center;gap:10px;white-space:nowrap}
+.topbar-logo svg{width:28px;height:28px;flex-shrink:0}
+.topbar-logo span{font-weight:700;font-size:1.1rem;letter-spacing:-.02em}
+.topbar-pills{display:flex;gap:8px;flex-wrap:wrap;margin-left:auto}
+.pill{
+  display:inline-flex;align-items:center;gap:6px;
+  padding:5px 12px;border-radius:999px;font-size:.75rem;font-weight:500;
+  background:var(--bg4);border:1px solid var(--border);color:var(--text2);
+  white-space:nowrap;
+}
+.pill .dot{width:6px;height:6px;border-radius:50%;flex-shrink:0}
+.pill .dot-blue{background:var(--accent)}
+.pill .dot-green{background:var(--green)}
+.pill .dot-amber{background:var(--amber)}
+
+/* ===== Main Layout ===== */
+.main{
+  display:grid;grid-template-columns:minmax(320px,2fr) 3fr;
+  gap:20px;padding:20px 24px;max-width:1440px;margin:0 auto;
+  align-items:start;
+}
+
+/* ===== Cards ===== */
+.card{
+  background:var(--bg2);border:1px solid var(--border);
+  border-radius:var(--radius);box-shadow:var(--shadow);
+  overflow:hidden;
+}
+.card-head{
+  padding:16px 20px;border-bottom:1px solid var(--border);
+  display:flex;align-items:center;gap:10px;
+}
+.card-head h2{font-size:.95rem;font-weight:600;letter-spacing:-.01em}
+.card-head .icon{width:18px;height:18px;opacity:.7}
+.card-body{padding:20px}
+
+/* ===== Form ===== */
+.form-grid{display:grid;gap:16px}
+.field{display:grid;gap:6px}
+.field label{
+  font-size:.78rem;font-weight:600;text-transform:uppercase;
+  letter-spacing:.06em;color:var(--text3);
+}
+.field .hint{font-size:.75rem;color:var(--text3);line-height:1.5;margin-top:2px}
+.field .hint code{
+  padding:1px 5px;border-radius:4px;background:var(--bg4);
+  font-family:var(--mono);font-size:.72rem;border:1px solid var(--border);
+}
+input,select{
+  width:100%;padding:10px 14px;border-radius:var(--radius-sm);
+  border:1px solid var(--border2);background:var(--bg4);color:var(--text);
+  font-size:.87rem;font-family:var(--font);transition:all .2s;
+}
+input:focus,select:focus{outline:none;border-color:var(--accent);box-shadow:0 0 0 3px var(--accent-dim)}
+input:hover,select:hover{border-color:var(--text3)}
+select{cursor:pointer;appearance:none;
+  background-image:url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='12' viewBox='0 0 24 24' fill='none' stroke='%2364748b' stroke-width='2'%3E%3Cpath d='M6 9l6 6 6-6'/%3E%3C/svg%3E");
+  background-repeat:no-repeat;background-position:right 12px center;padding-right:32px;
+}
+input[type="file"]{
+  padding:0;border:2px dashed var(--border2);border-radius:var(--radius-sm);
+  background:var(--bg);cursor:pointer;min-height:72px;
+  display:flex;align-items:center;justify-content:center;
+}
+input[type="file"]::file-selector-button{
+  padding:8px 16px;border-radius:6px;border:none;
+  background:var(--accent-dim);color:var(--accent);
+  font-size:.8rem;font-weight:600;cursor:pointer;margin-right:12px;
+  transition:background .2s;
+}
+input[type="file"]:hover{border-color:var(--accent)}
+input[type="file"]:hover::file-selector-button{background:rgba(59,130,246,.2)}
+.file-info{
+  font-size:.78rem;color:var(--text3);padding:6px 0 0;
+  display:none;align-items:center;gap:6px;
+}
+.file-info.show{display:flex}
+.file-info svg{width:14px;height:14px;flex-shrink:0;opacity:.6}
+
+.btn-submit{
+  width:100%;padding:12px;border:none;border-radius:var(--radius-sm);
+  background:linear-gradient(135deg,var(--accent),#6366f1);color:#fff;
+  font-size:.9rem;font-weight:600;cursor:pointer;transition:all .2s;
+  display:flex;align-items:center;justify-content:center;gap:8px;
+  margin-top:4px;
+}
+.btn-submit:hover{transform:translateY(-1px);box-shadow:0 4px 16px rgba(59,130,246,.3)}
+.btn-submit:active{transform:translateY(0)}
+.btn-submit:disabled{opacity:.55;cursor:not-allowed;transform:none;box-shadow:none}
+.btn-submit .spinner{
+  width:16px;height:16px;border:2px solid rgba(255,255,255,.3);
+  border-top-color:#fff;border-radius:50%;animation:spin .6s linear infinite;
+  display:none;
+}
+.btn-submit.loading .spinner{display:block}
+.btn-submit.loading .btn-text{opacity:.8}
+@keyframes spin{to{transform:rotate(360deg)}}
+
+/* ===== Output Panel ===== */
+.output-stack{display:grid;gap:16px}
+
+/* Status bar */
+.status-bar{
+  display:flex;flex-wrap:wrap;gap:8px;padding:12px 16px;
+  background:var(--bg4);border-radius:var(--radius-sm);
+  border:1px solid var(--border);
+}
+.status-item{
+  display:flex;align-items:center;gap:6px;font-size:.78rem;
+  padding:4px 10px;border-radius:6px;background:var(--bg2);
+  border:1px solid var(--border);
+}
+.status-item .label{color:var(--text3)}
+.status-item .value{color:var(--text);font-weight:500;font-family:var(--mono)}
+.status-item.active{border-color:var(--green);background:var(--green-dim)}
+.status-item.active .value{color:var(--green)}
+
+/* Progress */
+.progress-wrap{display:grid;gap:8px}
+.progress-meta{display:flex;justify-content:space-between;align-items:center}
+.progress-label{font-size:.78rem;font-weight:600;color:var(--text2)}
+.progress-pct{font-size:.78rem;font-weight:700;font-family:var(--mono);color:var(--accent)}
+.progress-bar{
+  height:8px;background:var(--bg4);border-radius:999px;overflow:hidden;
+  border:1px solid var(--border);
+}
+.progress-fill{
+  height:100%;width:0%;border-radius:999px;
+  background:linear-gradient(90deg,var(--accent),#818cf8);
+  transition:width .4s ease;position:relative;
+}
+.progress-fill::after{
+  content:'';position:absolute;inset:0;
+  background:linear-gradient(90deg,transparent,rgba(255,255,255,.25),transparent);
+  animation:shimmer 2s infinite;
+}
+@keyframes shimmer{0%{transform:translateX(-100%)}100%{transform:translateX(100%)}}
+
+/* Logs */
+.log-terminal{
+  background:var(--bg);border:1px solid var(--border);
+  border-radius:var(--radius-sm);overflow:hidden;
+}
+.log-header{
+  display:flex;align-items:center;gap:8px;padding:8px 14px;
+  background:var(--bg4);border-bottom:1px solid var(--border);
+  font-size:.75rem;color:var(--text3);
+}
+.log-header .dots{display:flex;gap:5px}
+.log-header .dots span{width:10px;height:10px;border-radius:50%}
+.log-header .dots .r{background:#ef4444}.log-header .dots .y{background:#f59e0b}.log-header .dots .g{background:#22c55e}
+.log-body{
+  padding:10px;height:240px;overflow-y:auto;
+  font:12px/1.65 var(--mono);display:flex;flex-direction:column;gap:3px;
+}
+.log-line{
+  padding:3px 8px;border-radius:4px;white-space:pre-wrap;word-break:break-all;
+}
+.log-info{color:var(--text2)}
+.log-stage{color:var(--amber);background:var(--amber-dim)}
+.log-chunk{color:var(--cyan);background:var(--cyan-dim)}
+.log-ok{color:var(--green);background:var(--green-dim)}
+.log-warn{color:var(--amber);background:var(--amber-dim)}
+.log-error{color:var(--red);background:var(--red-dim)}
+
+/* Tracks */
+.tracks-grid{display:grid;gap:12px}
+.track-card{
+  padding:14px 16px;border:1px solid var(--border);border-radius:var(--radius-sm);
+  background:var(--bg4);transition:all .2s;
+}
+.track-card:hover{border-color:var(--border2);transform:translateY(-1px)}
+.track-head{display:flex;justify-content:space-between;align-items:center;margin-bottom:10px}
+.track-name{font-size:.87rem;font-weight:600;display:flex;align-items:center;gap:8px}
+.track-badge{
+  font-size:.65rem;padding:2px 8px;border-radius:999px;
+  background:var(--purple-dim);color:var(--purple);font-weight:500;
+}
+.track-card audio{width:100%;height:36px;margin-bottom:8px}
+.track-actions{display:flex;gap:8px}
+.track-btn{
+  display:inline-flex;align-items:center;gap:5px;
+  padding:6px 14px;border-radius:6px;border:1px solid var(--border2);
+  background:var(--bg2);color:var(--text2);font-size:.78rem;font-weight:500;
+  text-decoration:none;cursor:pointer;transition:all .2s;
+}
+.track-btn:hover{background:var(--accent-dim);border-color:var(--accent);color:var(--accent)}
+.track-btn svg{width:14px;height:14px}
+.tracks-empty{
+  text-align:center;padding:40px 20px;color:var(--text3);font-size:.85rem;
+}
+.tracks-empty svg{width:48px;height:48px;margin-bottom:12px;opacity:.3}
+
+/* ===== Responsive ===== */
+@media(max-width:900px){
+  .main{grid-template-columns:1fr;padding:16px}
+  .topbar{padding:12px 16px;flex-wrap:wrap}
+  .topbar-pills{margin-left:0;width:100%}
+}
+@media(max-width:600px){
+  html{font-size:14px}
+  .main{padding:12px;gap:14px}
+  .card-body{padding:14px}
+  .log-body{height:180px}
+  .topbar{padding:10px 12px}
+  .pill{font-size:.7rem;padding:4px 8px}
+}
+
+/* ===== Animations ===== */
+@keyframes fadeIn{from{opacity:0;transform:translateY(8px)}to{opacity:1;transform:none}}
+.card{animation:fadeIn .35s ease}
+.track-card{animation:fadeIn .3s ease}
+@media(prefers-reduced-motion:reduce){
+  *{animation-duration:.01ms!important;transition-duration:.01ms!important}
+}
+</style>
+</head>
+<body>
+
+<!-- Top Bar -->
+<div class="topbar">
+  <div class="topbar-logo">
+    <svg viewBox="0 0 28 28" fill="none"><rect width="28" height="28" rx="7" fill="url(#g1)"/><path d="M8 10h12M8 14h8M8 18h10" stroke="#fff" stroke-width="1.8" stroke-linecap="round"/><defs><linearGradient id="g1" x1="0" y1="0" x2="28" y2="28"><stop stop-color="#3b82f6"/><stop offset="1" stop-color="#8b5cf6"/></linearGradient></defs></svg>
+    <span>CudaInfer</span>
+  </div>
+  <div class="topbar-pills">
+    <div class="pill"><span class="dot dot-blue"></span>{{DEVICE}}</div>
+    <div class="pill"><span class="dot dot-green"></span>{{MODEL_DIR}}</div>
+    <div class="pill"><span class="dot dot-amber"></span>{{HOST_PORT}}</div>
+  </div>
+</div>
+
+<!-- Main -->
+<div class="main">
+
+  <!-- Left: Form -->
+  <div class="card" id="form-card">
+    <div class="card-head">
+      <svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 5v14M5 12h14"/></svg>
+      <h2>Create Job</h2>
+    </div>
+    <div class="card-body">
+      <form id="infer-form" class="form-grid">
+        <div class="field">
+          <label for="model">Model</label>
+          <select id="model" name="model">{{MODEL_OPTIONS}}</select>
+        </div>
+        <div class="field">
+          <label for="audio">Audio File</label>
+          <input id="audio" name="audio" type="file" accept="audio/*" required>
+          <div class="file-info" id="file-info">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M9 18V5l12-2v13"/><circle cx="6" cy="18" r="3"/><circle cx="18" cy="16" r="3"/></svg>
+            <span id="file-name"></span>
+          </div>
+        </div>
+        <div class="field">
+          <label for="overlap">Overlap</label>
+          <input id="overlap" name="overlap" type="number" step="0.01" placeholder="Model default">
+          <div class="hint">Override chunk overlap ratio. Leave empty to use model default.</div>
+        </div>
+        <div class="field">
+          <label for="precision_mode">Precision</label>
+          <select id="precision_mode" name="precision_mode">{{PRECISION_OPTIONS}}</select>
+          <div class="hint">Not "force FP32/FP16". Off = original <code>.csm</code> dtype; On = FP16 linear + mixed-precision attention.</div>
+        </div>
+        <div class="field">
+          <label for="cuda_graph">CUDA Graph</label>
+          <select id="cuda_graph" name="cuda_graph">{{CUDA_GRAPH_OPTIONS}}</select>
+          <div class="hint">Attention CUDA Graph path. Faster but increases VRAM usage.</div>
+        </div>
+        <div class="field">
+          <label for="keep_model_loaded">Keep Model Loaded</label>
+          <select id="keep_model_loaded" name="keep_model_loaded">{{KEEP_MODEL_OPTIONS}}</select>
+          <div class="hint">Off = release after job; On = faster subsequent jobs.</div>
+        </div>
+        <div class="field">
+          <label for="chunk_batch_size">Chunk Batch Size</label>
+          <input id="chunk_batch_size" name="chunk_batch_size" type="number" min="1" step="1" placeholder="Model default">
+          <div class="hint">Override chunk inference batch size.</div>
+        </div>
+        <button type="submit" class="btn-submit" id="submit-btn">
+          <span class="spinner"></span>
+          <span class="btn-text">Start Inference</span>
+        </button>
+      </form>
+    </div>
+  </div>
+
+  <!-- Right: Output -->
+  <div style="display:grid;gap:16px">
+
+    <!-- Status + Progress -->
+    <div class="card">
+      <div class="card-head">
+        <svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M22 12h-4l-3 9L9 3l-3 9H2"/></svg>
+        <h2>Status</h2>
+      </div>
+      <div class="card-body">
+        <div class="output-stack">
+          <div class="status-bar" id="status-bar">
+            <div class="status-item" id="si-status"><span class="label">Status</span><span class="value">Idle</span></div>
+            <div class="status-item" id="si-elapsed"><span class="label">Elapsed</span><span class="value">00:00</span></div>
+            <div class="status-item" id="si-precision"><span class="label">Precision</span><span class="value">{{PRECISION_TITLE}} - {{PRECISION_DESC}}</span></div>
+            <div class="status-item" id="si-graph"><span class="label">Graph</span><span class="value">{{CUDA_GRAPH}}</span></div>
+            <div class="status-item" id="si-keep"><span class="label">Keep</span><span class="value">{{KEEP_MODEL}}</span></div>
+            <div class="status-item" id="si-batch"><span class="label">Batch</span><span class="value">{{CHUNK_BATCH}}</span></div>
+          </div>
+          <div class="progress-wrap">
+            <div class="progress-meta">
+              <span class="progress-label" id="progress-label">Ready</span>
+              <span class="progress-pct" id="progress-pct">0%</span>
+            </div>
+            <div class="progress-bar"><div class="progress-fill" id="progress-fill"></div></div>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- Logs -->
+    <div class="card">
+      <div class="card-head">
+        <svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="2" y="3" width="20" height="18" rx="3"/><path d="M7 8h10M7 12h6"/></svg>
+        <h2>Logs</h2>
+      </div>
+      <div class="log-terminal">
+        <div class="log-header">
+          <div class="dots"><span class="r"></span><span class="y"></span><span class="g"></span></div>
+          <span>terminal</span>
+        </div>
+        <div class="log-body" id="log-body">
+          <div class="log-line log-info">[idle] Select a model and upload an audio file to begin.</div>
+        </div>
+      </div>
+    </div>
+
+    <!-- Tracks -->
+    <div class="card">
+      <div class="card-head">
+        <svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M9 18V5l12-2v13"/><circle cx="6" cy="18" r="3"/><circle cx="18" cy="16" r="3"/></svg>
+        <h2>Output Tracks</h2>
+      </div>
+      <div class="card-body">
+        <div id="tracks" class="tracks-grid">
+          <div class="tracks-empty">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M9 18V5l12-2v13"/><circle cx="6" cy="18" r="3"/><circle cx="18" cy="16" r="3"/></svg>
+            <div>No output yet. Tracks will appear here after inference completes.</div>
+          </div>
+        </div>
+      </div>
+    </div>
+
+  </div>
+</div>
+
+<script>
+(function(){
+  const form = document.getElementById('infer-form');
+  const btn = document.getElementById('submit-btn');
+  const btnText = btn.querySelector('.btn-text');
+  const logBody = document.getElementById('log-body');
+  const tracksEl = document.getElementById('tracks');
+  const progressFill = document.getElementById('progress-fill');
+  const progressPct = document.getElementById('progress-pct');
+  const progressLabel = document.getElementById('progress-label');
+  const siStatus = document.querySelector('#si-status .value');
+  const siElapsed = document.querySelector('#si-elapsed .value');
+  const fileInfo = document.getElementById('file-info');
+  const fileName = document.getElementById('file-name');
+
+  let timer = null, poller = null, startedAt = 0;
+
+  // File input display
+  document.getElementById('audio').addEventListener('change', function(){
+    if(this.files.length){
+      const f = this.files[0];
+      const sz = f.size > 1048576 ? (f.size/1048576).toFixed(1)+'MB' : (f.size/1024).toFixed(0)+'KB';
+      fileName.textContent = f.name + ' (' + sz + ')';
+      fileInfo.classList.add('show');
+    } else {
+      fileInfo.classList.remove('show');
+    }
+  });
+
+  function fmt(ms){
+    var s = Math.floor(ms/1000), m = Math.floor(s/60);
+    return String(m).padStart(2,'0') + ':' + String(s%60).padStart(2,'0');
+  }
+
+  function setState(status, progress){
+    siStatus.textContent = status;
+    progressLabel.textContent = status;
+    progressPct.textContent = progress + '%';
+    progressFill.style.width = progress + '%';
+
+    var si = document.getElementById('si-status');
+    if(status === 'Running' || status === 'Uploading' || status === 'Queued'){
+      si.classList.add('active');
+    } else {
+      si.classList.remove('active');
+    }
+  }
+
+  function classifyLog(line){
+    if(line.includes('fail') || line.includes('error') || line.includes('Error') || line.includes('失败')) return 'log-error';
+    if(line.includes('done') || line.includes('complete') || line.includes('就绪') || line.includes('完成')) return 'log-ok';
+    if(line.includes('chunk') || line.includes('分片')) return 'log-chunk';
+    if(line.startsWith('[') || line.startsWith('-') || line.includes('stage') || line.includes('阶段')) return 'log-stage';
+    if(line.includes('warn') || line.includes('警告')) return 'log-warn';
+    return 'log-info';
+  }
+
+  function setLogs(lines){
+    var list = lines && lines.length ? lines : ['Waiting for job logs...'];
+    logBody.innerHTML = list.map(function(l){
+      return '<div class="log-line ' + classifyLog(l) + '">' +
+        l.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;') +
+        '</div>';
+    }).join('');
+    logBody.scrollTop = logBody.scrollHeight;
+  }
+
+  function renderTracks(data){
+    if(!data.tracks || !data.tracks.length){
+      tracksEl.innerHTML = '<div class="tracks-empty"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M9 18V5l12-2v13"/><circle cx="6" cy="18" r="3"/><circle cx="18" cy="16" r="3"/></svg><div>Job completed but no tracks were returned.</div></div>';
+      return;
+    }
+    tracksEl.innerHTML = '';
+    data.tracks.forEach(function(t, i){
+      var card = document.createElement('div');
+      card.className = 'track-card';
+      var badge = t.derived ? '<span class="track-badge">derived</span>' : '';
+      card.innerHTML =
+        '<div class="track-head"><div class="track-name">' + t.name + badge + '</div></div>' +
+        '<audio controls preload="none" src="' + t.url + '"></audio>' +
+        '<div class="track-actions">' +
+          '<a class="track-btn" href="' + t.url + '" download>' +
+            '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 15v4a2 2 0 01-2 2H5a2 2 0 01-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg>' +
+            'Download WAV</a>' +
+        '</div>';
+      tracksEl.appendChild(card);
+    });
+  }
+
+  function startTimer(){
+    startedAt = Date.now();
+    clearInterval(timer);
+    timer = setInterval(function(){
+      siElapsed.textContent = fmt(Date.now() - startedAt);
+    }, 250);
+  }
+
+  function stopTimer(){ clearInterval(timer); timer = null; }
+
+  function pollJob(id){
+    clearInterval(poller);
+    poller = setInterval(async function(){
+      try {
+        var res = await fetch('/api/jobs/' + id);
+        var data = await res.json();
+        setState(data.status, data.progress || 0);
+        setLogs(data.logs || []);
+        if(data.elapsed_ms != null) siElapsed.textContent = fmt(data.elapsed_ms);
+
+        if(data.status === '已完成'){
+          stopTimer(); clearInterval(poller);
+          btn.disabled = false; btn.classList.remove('loading');
+          btnText.textContent = 'Start Inference';
+          setState('Done', 100);
+          renderTracks(data);
+        } else if(data.status === '失败'){
+          stopTimer(); clearInterval(poller);
+          btn.disabled = false; btn.classList.remove('loading');
+          btnText.textContent = 'Start Inference';
+          setState('Failed', data.progress || 0);
+          tracksEl.innerHTML = '<div class="tracks-empty"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><circle cx="12" cy="12" r="10"/><path d="M15 9l-6 6M9 9l6 6"/></svg><div>' + (data.error || 'Inference failed.') + '</div></div>';
+        }
+      } catch(err){
+        stopTimer(); clearInterval(poller);
+        btn.disabled = false; btn.classList.remove('loading');
+        btnText.textContent = 'Start Inference';
+        setLogs(['[poll] Failed to fetch job status: ' + err.message]);
+      }
+    }, 700);
+  }
+
+  form.addEventListener('submit', async function(e){
+    e.preventDefault();
+    var fd = new FormData(form);
+    if(!fd.get('audio') || !fd.get('model')) return;
+
+    btn.disabled = true; btn.classList.add('loading');
+    btnText.textContent = 'Uploading...';
+    tracksEl.innerHTML = '<div class="tracks-empty"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><circle cx="12" cy="12" r="10"/><path d="M12 8v4l3 3"/></svg><div>Waiting for output tracks...</div></div>';
+    setLogs(['[init] Uploading audio and creating job...']);
+    setState('Uploading', 2);
+    startTimer();
+
+    try {
+      var res = await fetch('/api/jobs', { method:'POST', body:fd });
+      var text = await res.text();
+      var data = {};
+      try { data = JSON.parse(text); } catch(_){}
+      if(!res.ok) throw new Error(data.error || text || 'Request failed');
+
+      btnText.textContent = 'Running...';
+      setState(data.status || 'Queued', data.progress || 5);
+      setLogs(data.logs || ['[queue] Job entered waiting queue.']);
+      pollJob(data.id);
+    } catch(err){
+      stopTimer();
+      btn.disabled = false; btn.classList.remove('loading');
+      btnText.textContent = 'Start Inference';
+      setState('Failed', 0);
+      setLogs(['[error] Failed to create job: ' + err.message]);
+    }
+  });
+
+  setLogs(['[idle] Select a model and upload an audio file to begin.']);
+})();
+</script>
+</body>
+</html>

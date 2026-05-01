@@ -32,6 +32,20 @@ endif()
 include_directories(${CMAKE_SOURCE_DIR}/src)
 include_directories(${CMAKE_SOURCE_DIR}/third_party)
 
+# Embed HTML into binary
+set(WEBUI_HTML "${CMAKE_SOURCE_DIR}/src/webui.html")
+set(WEBUI_HEADER "${CMAKE_BINARY_DIR}/webui_embedded.h")
+find_package(Python3 REQUIRED COMPONENTS Interpreter)
+
+add_custom_command(
+    OUTPUT ${WEBUI_HEADER}
+    COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tools/embed_html.py ${WEBUI_HTML} ${WEBUI_HEADER}
+    DEPENDS ${WEBUI_HTML} ${CMAKE_SOURCE_DIR}/tools/embed_html.py
+    COMMENT "Embedding webui.html into C++ header"
+)
+add_custom_target(webui_embed DEPENDS ${WEBUI_HEADER})
+include_directories(${CMAKE_BINARY_DIR})
+
 # cuDNN paths — configurable via CMake cache variables
 # Default: nvidia-cudnn-cu12 pip package location (Windows)
 if(NOT DEFINED CUDNN_ROOT)
@@ -58,6 +72,7 @@ set(ALL_SOURCES ${CUDA_SOURCES} ${CPP_SOURCES})
 
 # Main executable
 add_executable(cudasep_infer ${ALL_SOURCES})
+add_dependencies(cudasep_infer webui_embed)
 
 # Platform-specific cuDNN linking
 if(WIN32)
