@@ -136,6 +136,7 @@ static Tensor process_chunked(const Tensor& audio, int chunk_size, int step, Chu
     }
     int64_t chunk_count = (int64_t)chunk_starts.size();
     int effective_batch = std::max(1, (int)std::min<int64_t>((int64_t)chunk_batch_size, chunk_count));
+    bool single_chunk_mode = (effective_batch == 1);
 
     auto prepare_input_chunk = [&](int64_t start, int64_t end) {
         auto chunk_prepare_start = Clock::now();
@@ -154,21 +155,34 @@ static Tensor process_chunked(const Tensor& audio, int chunk_size, int step, Chu
         return chunk;
     };
 
-    std::vector<Tensor> first_group_inputs;
-    int first_group = std::min<int64_t>(effective_batch, chunk_count);
-    first_group_inputs.reserve((size_t)first_group);
-    for (int i = 0; i < first_group; ++i) {
-        int64_t start = chunk_starts[(size_t)i];
+    Tensor first_batch_out;
+    if (single_chunk_mode) {
+        int64_t start = chunk_starts.front();
         int64_t end = std::min(start + chunk_size, total_samples);
-        first_group_inputs.push_back(prepare_input_chunk(start, end));
-    }
+        Tensor first_chunk = prepare_input_chunk(start, end);
+        auto first_forward_start = Clock::now();
+        first_batch_out = model_forward(first_chunk);
+        if (collect_timing) {
+            cudaDeviceSynchronize();
+            forward_ms += elapsed_ms(first_forward_start, Clock::now());
+        }
+    } else {
+        std::vector<Tensor> first_group_inputs;
+        int first_group = std::min<int64_t>(effective_batch, chunk_count);
+        first_group_inputs.reserve((size_t)first_group);
+        for (int i = 0; i < first_group; ++i) {
+            int64_t start = chunk_starts[(size_t)i];
+            int64_t end = std::min(start + chunk_size, total_samples);
+            first_group_inputs.push_back(prepare_input_chunk(start, end));
+        }
 
-    auto first_forward_start = Clock::now();
-    Tensor first_batch_in = Tensor::cat(first_group_inputs, 0);
-    Tensor first_batch_out = model_forward(first_batch_in);
-    if (collect_timing) {
-        cudaDeviceSynchronize();
-        forward_ms += elapsed_ms(first_forward_start, Clock::now());
+        auto first_forward_start = Clock::now();
+        Tensor first_batch_in = Tensor::cat(first_group_inputs, 0);
+        first_batch_out = model_forward(first_batch_in);
+        if (collect_timing) {
+            cudaDeviceSynchronize();
+            forward_ms += elapsed_ms(first_forward_start, Clock::now());
+        }
     }
 
     std::vector<int64_t> out_shape = first_batch_out.shape();
@@ -208,6 +222,16 @@ static Tensor process_chunked(const Tensor& audio, int chunk_size, int step, Chu
         Tensor batch_out;
         if (group_start == 0) {
             batch_out = first_batch_out;
+        } else if (single_chunk_mode) {
+            int64_t start = chunk_starts[(size_t)group_start];
+            int64_t end = std::min(start + chunk_size, total_samples);
+            Tensor chunk_in = prepare_input_chunk(start, end);
+            auto chunk_forward_start = Clock::now();
+            batch_out = model_forward(chunk_in);
+            if (collect_timing) {
+                cudaDeviceSynchronize();
+                forward_ms += elapsed_ms(chunk_forward_start, Clock::now());
+            }
         } else {
             std::vector<Tensor> batch_inputs;
             batch_inputs.reserve((size_t)group_size);
@@ -232,7 +256,7 @@ static Tensor process_chunked(const Tensor& audio, int chunk_size, int step, Chu
             bool last_chunk = (end >= total_samples);
             chunk_index++;
 
-            Tensor chunk_out = batch_out.slice(0, local, local + 1).contiguous();
+            Tensor chunk_out = single_chunk_mode ? batch_out : batch_out.slice(0, local, local + 1).contiguous();
             if (chunk_out.size(-1) > actual_len) {
                 chunk_out = chunk_out.slice(-1, 0, actual_len);
             }
@@ -359,7 +383,6 @@ LoadedModel load_model(const std::string& model_path, int device, bool quantize_
 
     if (quantize_fp16) {
         auto fp16_start = Clock::now();
-        g_quantize_fp16 = true;
         model.weights.convert_linear_weights_to_fp16();
         if (logger) {
             logger("[耗时] FP16 量化准备: " + format_ms(elapsed_ms(fp16_start, Clock::now())));

@@ -11,6 +11,11 @@
 #include "flash_attention.cuh"
 #include <cmath>
 #include <cfloat>
+#include <cstdint>
+#include <cstring>
+#include <memory>
+#include <mutex>
+#include <unordered_map>
 
 namespace cudasep {
 
@@ -24,6 +29,18 @@ static inline int64_t ceildiv(int64_t a, int64_t b) {
     return (a + b - 1) / b;
 }
 
+static inline uint32_t float_bits(float value) {
+    uint32_t bits = 0;
+    std::memcpy(&bits, &value, sizeof(bits));
+    return bits;
+}
+
+static inline float float_from_bits(uint32_t bits) {
+    float value = 0.0f;
+    std::memcpy(&value, &bits, sizeof(value));
+    return value;
+}
+
 static Tensor ensure_f32(const Tensor& x) {
     if (x.dtype() == DType::Float32) return x.contiguous();
     return x.to_f32().contiguous();
@@ -32,6 +49,318 @@ static Tensor ensure_f32(const Tensor& x) {
 static Tensor maybe_cast_back(const Tensor& result, DType orig) {
     if (orig == DType::Float16) return result.to_f16();
     return result;
+}
+
+static bool is_f32_contiguous(const Tensor& x) {
+    return x.dtype() == DType::Float32 && x.is_contiguous();
+}
+
+static void clear_cuda_error_state(cudaStream_t stream) {
+    (void)cudaGetLastError();
+    (void)cudaStreamSynchronize(stream);
+    (void)cudaGetLastError();
+}
+
+static void async_copy_tensor(Tensor& dst, const Tensor& src, cudaStream_t stream) {
+    if (dst.numel() != src.numel()) {
+        throw std::runtime_error("async_copy_tensor: size mismatch");
+    }
+    if (dst.dtype() != src.dtype()) {
+        throw std::runtime_error("async_copy_tensor: dtype mismatch");
+    }
+    size_t bytes = (size_t)dst.numel() * dtype_size(dst.dtype());
+    if (bytes > 0) {
+        CUDA_CHECK(cudaMemcpyAsync(dst.data_ptr(), src.data_ptr(), bytes,
+                                   cudaMemcpyDeviceToDevice, stream));
+    }
+}
+
+__global__ void convert_f32_to_f16_kernel(const float* __restrict__ src,
+                                          __half* __restrict__ dst,
+                                          int64_t count) {
+    int64_t idx = (int64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < count) {
+        dst[idx] = __float2half(src[idx]);
+    }
+}
+
+__global__ void fused_scale_softmax_kernel(float* __restrict__ data, float scale,
+                                            int rows, int cols);
+
+__global__ void fused_scale_softmax_to_half_kernel(const float* __restrict__ data,
+                                                   __half* __restrict__ out,
+                                                   float scale,
+                                                   int rows,
+                                                   int cols);
+
+static void launch_materialized_attention(cublasHandle_t handle,
+                                          const Tensor& qf,
+                                          const Tensor& kf,
+                                          const Tensor& vf,
+                                          const Tensor* vh,
+                                          bool use_fp16_value_gemm,
+                                          float scale,
+                                          Tensor& out,
+                                          Tensor& scores,
+                                          Tensor* scores_half) {
+    const int64_t B = qf.size(0);
+    const int64_t H = qf.size(1);
+    const int64_t N = qf.size(2);
+    const int64_t D = qf.size(3);
+    const int64_t N_k = kf.size(2);
+    const int64_t BH = B * H;
+
+    {
+        float alpha = 1.0f;
+        float beta  = 0.0f;
+        int m = static_cast<int>(N);
+        int n = static_cast<int>(N_k);
+        int kk = static_cast<int>(D);
+        long long int strideA = static_cast<long long int>(N * D);
+        long long int strideB = static_cast<long long int>(N_k * D);
+        long long int strideC = static_cast<long long int>(N * N_k);
+
+        cublasGemmStridedBatchedEx(handle,
+            CUBLAS_OP_T, CUBLAS_OP_N,
+            n, m, kk, &alpha,
+            kf.data_f32(), CUDA_R_32F, kk, strideB,
+            qf.data_f32(), CUDA_R_32F, kk, strideA,
+            &beta, scores.data_f32(), CUDA_R_32F, n, strideC,
+            static_cast<int>(BH),
+            CUBLAS_COMPUTE_32F_FAST_TF32,
+            CUBLAS_GEMM_DEFAULT_TENSOR_OP);
+    }
+
+    {
+        int total_rows = static_cast<int>(BH * N);
+        int cols = static_cast<int>(N_k);
+        int threads_po2 = 1;
+        while (threads_po2 < cols && threads_po2 < kBlockSize) threads_po2 <<= 1;
+        size_t smem_bytes = threads_po2 * sizeof(float);
+        if (use_fp16_value_gemm) {
+            fused_scale_softmax_to_half_kernel<<<total_rows, threads_po2, smem_bytes>>>(
+                scores.data_f32(), scores_half->data_f16(), scale, total_rows, cols);
+        } else {
+            fused_scale_softmax_kernel<<<total_rows, threads_po2, smem_bytes>>>(
+                scores.data_f32(), scale, total_rows, cols);
+        }
+    }
+
+    {
+        float alpha = 1.0f;
+        float beta  = 0.0f;
+        int m = static_cast<int>(N);
+        int kk = static_cast<int>(N_k);
+        int n = static_cast<int>(D);
+        long long int strideA = static_cast<long long int>(N * N_k);
+        long long int strideB = static_cast<long long int>(N_k * D);
+        long long int strideC = static_cast<long long int>(N * D);
+
+        if (use_fp16_value_gemm) {
+            cublasGemmStridedBatchedEx(handle,
+                CUBLAS_OP_N, CUBLAS_OP_N,
+                n, m, kk, &alpha,
+                vh->data_ptr(), CUDA_R_16F, n, strideB,
+                scores_half->data_ptr(), CUDA_R_16F, kk, strideA,
+                &beta, out.data_f32(), CUDA_R_32F, n, strideC,
+                static_cast<int>(BH),
+                CUBLAS_COMPUTE_32F,
+                CUBLAS_GEMM_DEFAULT_TENSOR_OP);
+        } else {
+            cublasGemmStridedBatchedEx(handle,
+                CUBLAS_OP_N, CUBLAS_OP_N,
+                n, m, kk, &alpha,
+                vf.data_f32(), CUDA_R_32F, n, strideB,
+                scores.data_f32(), CUDA_R_32F, kk, strideA,
+                &beta, out.data_f32(), CUDA_R_32F, n, strideC,
+                static_cast<int>(BH),
+                CUBLAS_COMPUTE_32F_FAST_TF32,
+                CUBLAS_GEMM_DEFAULT_TENSOR_OP);
+        }
+    }
+}
+
+struct AttentionGraphKey {
+    int64_t B = 0;
+    int64_t H = 0;
+    int64_t N = 0;
+    int64_t D = 0;
+    int64_t N_k = 0;
+    uint32_t scale_bits = 0;
+    bool use_fp16_value_gemm = false;
+
+    bool operator==(const AttentionGraphKey& other) const {
+        return B == other.B && H == other.H && N == other.N && D == other.D &&
+               N_k == other.N_k && scale_bits == other.scale_bits &&
+               use_fp16_value_gemm == other.use_fp16_value_gemm;
+    }
+};
+
+struct AttentionGraphKeyHash {
+    size_t operator()(const AttentionGraphKey& key) const {
+        size_t seed = std::hash<int64_t>{}(key.B);
+        seed ^= std::hash<int64_t>{}(key.H) + 0x9e3779b9 + (seed << 6) + (seed >> 2);
+        seed ^= std::hash<int64_t>{}(key.N) + 0x9e3779b9 + (seed << 6) + (seed >> 2);
+        seed ^= std::hash<int64_t>{}(key.D) + 0x9e3779b9 + (seed << 6) + (seed >> 2);
+        seed ^= std::hash<int64_t>{}(key.N_k) + 0x9e3779b9 + (seed << 6) + (seed >> 2);
+        seed ^= std::hash<uint32_t>{}(key.scale_bits) + 0x9e3779b9 + (seed << 6) + (seed >> 2);
+        seed ^= std::hash<bool>{}(key.use_fp16_value_gemm) + 0x9e3779b9 + (seed << 6) + (seed >> 2);
+        return seed;
+    }
+};
+
+struct AttentionGraphCache {
+    explicit AttentionGraphCache(const AttentionGraphKey& graph_key) : key(graph_key) {}
+
+    ~AttentionGraphCache() {
+        if (exec != nullptr) cudaGraphExecDestroy(exec);
+        if (graph != nullptr) cudaGraphDestroy(graph);
+    }
+
+    AttentionGraphKey key;
+    Tensor q_in;
+    Tensor k_in;
+    Tensor v_in;
+    Tensor vh;
+    Tensor scores;
+    Tensor scores_half;
+    Tensor out;
+    cudaGraph_t graph = nullptr;
+    cudaGraphExec_t exec = nullptr;
+    bool capture_failed = false;
+    bool initialized = false;
+};
+
+static std::shared_ptr<AttentionGraphCache> get_attention_graph_cache(const AttentionGraphKey& key) {
+    static std::mutex cache_mutex;
+    static std::unordered_map<AttentionGraphKey, std::shared_ptr<AttentionGraphCache>, AttentionGraphKeyHash> caches;
+
+    std::lock_guard<std::mutex> lock(cache_mutex);
+    auto it = caches.find(key);
+    if (it != caches.end()) {
+        return it->second;
+    }
+    auto cache = std::make_shared<AttentionGraphCache>(key);
+    caches.emplace(key, cache);
+    return cache;
+}
+
+static bool initialize_attention_graph(AttentionGraphCache& cache) {
+    const auto& key = cache.key;
+    cache.q_in = Tensor::empty({key.B, key.H, key.N, key.D}, DType::Float32);
+    cache.k_in = Tensor::empty({key.B, key.H, key.N_k, key.D}, DType::Float32);
+    cache.v_in = Tensor::empty({key.B, key.H, key.N_k, key.D}, DType::Float32);
+    cache.scores = Tensor::empty({key.B * key.H, key.N, key.N_k}, DType::Float32);
+    cache.out = Tensor::empty({key.B * key.H, key.N, key.D}, DType::Float32);
+    if (key.use_fp16_value_gemm) {
+        cache.vh = Tensor::empty({key.B, key.H, key.N_k, key.D}, DType::Float16);
+        cache.scores_half = Tensor::empty({key.B * key.H, key.N, key.N_k}, DType::Float16);
+    }
+
+    cublasHandle_t handle = CudaContext::instance().cublas();
+    cudaStream_t stream = CudaContext::instance().stream();
+    CUDA_CHECK(cudaStreamSynchronize(stream));
+
+    // Warm up library internals outside capture so the first lazy init does not invalidate graph capture.
+    if (key.use_fp16_value_gemm) {
+        int64_t count = cache.v_in.numel();
+        int grid = (int)ceildiv(count, (int64_t)kBlockSize);
+        convert_f32_to_f16_kernel<<<grid, kBlockSize>>>(cache.v_in.data_f32(), cache.vh.data_f16(), count);
+    }
+    launch_materialized_attention(handle,
+                                  cache.q_in,
+                                  cache.k_in,
+                                  cache.v_in,
+                                  key.use_fp16_value_gemm ? &cache.vh : nullptr,
+                                  key.use_fp16_value_gemm,
+                                  float_from_bits(key.scale_bits),
+                                  cache.out,
+                                  cache.scores,
+                                  key.use_fp16_value_gemm ? &cache.scores_half : nullptr);
+    CUDA_CHECK(cudaStreamSynchronize(stream));
+
+    cudaError_t capture_status = cudaStreamBeginCapture(stream, cudaStreamCaptureModeThreadLocal);
+    if (capture_status != cudaSuccess) {
+        clear_cuda_error_state(stream);
+        return false;
+    }
+
+    if (key.use_fp16_value_gemm) {
+        int64_t count = cache.v_in.numel();
+        int grid = (int)ceildiv(count, (int64_t)kBlockSize);
+        convert_f32_to_f16_kernel<<<grid, kBlockSize>>>(cache.v_in.data_f32(), cache.vh.data_f16(), count);
+    }
+
+    launch_materialized_attention(handle,
+                                  cache.q_in,
+                                  cache.k_in,
+                                  cache.v_in,
+                                  key.use_fp16_value_gemm ? &cache.vh : nullptr,
+                                  key.use_fp16_value_gemm,
+                                  float_from_bits(key.scale_bits),
+                                  cache.out,
+                                  cache.scores,
+                                  key.use_fp16_value_gemm ? &cache.scores_half : nullptr);
+
+    cudaGraph_t graph = nullptr;
+    capture_status = cudaStreamEndCapture(stream, &graph);
+    if (capture_status != cudaSuccess || graph == nullptr) {
+        if (graph != nullptr) cudaGraphDestroy(graph);
+        clear_cuda_error_state(stream);
+        return false;
+    }
+
+    cudaGraphExec_t exec = nullptr;
+    cudaError_t instantiate_status = cudaGraphInstantiate(&exec, graph, nullptr, nullptr, 0);
+    if (instantiate_status != cudaSuccess) {
+        cudaGraphDestroy(graph);
+        clear_cuda_error_state(stream);
+        return false;
+    }
+
+    cache.graph = graph;
+    cache.exec = exec;
+    cache.initialized = true;
+    return true;
+}
+
+static bool try_run_attention_graph(const Tensor& q,
+                                    const Tensor& k,
+                                    const Tensor& v,
+                                    float scale,
+                                    bool use_fp16_value_gemm,
+                                    DType orig_dtype,
+                                    Tensor& result) {
+    if (!is_f32_contiguous(q) || !is_f32_contiguous(k) || !is_f32_contiguous(v)) {
+        return false;
+    }
+
+    AttentionGraphKey key;
+    key.B = q.size(0);
+    key.H = q.size(1);
+    key.N = q.size(2);
+    key.D = q.size(3);
+    key.N_k = k.size(2);
+    key.scale_bits = float_bits(scale);
+    key.use_fp16_value_gemm = use_fp16_value_gemm;
+
+    auto cache = get_attention_graph_cache(key);
+    if (cache->capture_failed) {
+        return false;
+    }
+    if (!cache->initialized && !initialize_attention_graph(*cache)) {
+        cache->capture_failed = true;
+        return false;
+    }
+
+    cudaStream_t stream = CudaContext::instance().stream();
+    async_copy_tensor(cache->q_in, q, stream);
+    async_copy_tensor(cache->k_in, k, stream);
+    async_copy_tensor(cache->v_in, v, stream);
+    CUDA_CHECK(cudaGraphLaunch(cache->exec, stream));
+
+    result = maybe_cast_back(cache->out.reshape({key.B, key.H, key.N, key.D}), orig_dtype);
+    return true;
 }
 
 // ---------------------------------------------------------------------------
@@ -106,6 +435,68 @@ __global__ void fused_scale_softmax_kernel(float* __restrict__ data, float scale
     }
 }
 
+__global__ void fused_scale_softmax_to_half_kernel(const float* __restrict__ data,
+                                                   __half* __restrict__ out,
+                                                   float scale,
+                                                   int rows,
+                                                   int cols) {
+    int row = blockIdx.x;
+    if (row >= rows) return;
+
+    extern __shared__ float smem[];
+    const float* row_data = data + (int64_t)row * cols;
+    __half* row_out = out + (int64_t)row * cols;
+    int tid = threadIdx.x;
+    int num_threads = blockDim.x;
+
+    constexpr int MAX_ELEMS = 32;
+    float reg[MAX_ELEMS];
+    int elems_per_thread = (cols + num_threads - 1) / num_threads;
+
+    float thread_max = -FLT_MAX;
+    for (int i = 0; i < elems_per_thread; i++) {
+        int j = tid + i * num_threads;
+        float v = (j < cols) ? row_data[j] * scale : -FLT_MAX;
+        reg[i] = v;
+        if (v > thread_max) thread_max = v;
+    }
+
+    smem[tid] = thread_max;
+    __syncthreads();
+    for (int s = num_threads >> 1; s > 0; s >>= 1) {
+        if (tid < s && smem[tid + s] > smem[tid]) smem[tid] = smem[tid + s];
+        __syncthreads();
+    }
+    float max_val = smem[0];
+    __syncthreads();
+
+    float thread_sum = 0.0f;
+    for (int i = 0; i < elems_per_thread; i++) {
+        int j = tid + i * num_threads;
+        if (j < cols) {
+            float e = __expf(reg[i] - max_val);
+            reg[i] = e;
+            thread_sum += e;
+        }
+    }
+
+    smem[tid] = thread_sum;
+    __syncthreads();
+    for (int s = num_threads >> 1; s > 0; s >>= 1) {
+        if (tid < s) smem[tid] += smem[tid + s];
+        __syncthreads();
+    }
+    float inv_sum = 1.0f / smem[0];
+    __syncthreads();
+
+    for (int i = 0; i < elems_per_thread; i++) {
+        int j = tid + i * num_threads;
+        if (j < cols) {
+            row_out[j] = __float2half(reg[i] * inv_sum);
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // scaled_dot_product_attention
 // ---------------------------------------------------------------------------
@@ -128,23 +519,25 @@ Tensor scaled_dot_product_attention(const Tensor& q, const Tensor& k, const Tens
 
     DType orig_dtype = q.dtype();
 
-    // ---- ensure f32 contiguous ----
-    Tensor qf = ensure_f32(q);   // [B, H, N,   D]
-    Tensor kf = ensure_f32(k);   // [B, H, N_k, D]
-    Tensor vf = ensure_f32(v);   // [B, H, N_k, D]
-    bool use_fp16_attention = g_quantize_fp16 && D <= 128;
-    Tensor qh;
-    Tensor kh;
-    Tensor vh;
-    if (use_fp16_attention) {
-        qh = qf.to_f16().contiguous();
-        kh = kf.to_f16().contiguous();
-        vh = vf.to_f16().contiguous();
-    }
+    bool use_fp16_value_gemm = g_quantize_fp16 && D <= 128;
 
     // ---- default scale ----
     if (scale == 0.0f) {
         scale = 1.0f / sqrtf(static_cast<float>(D));
+    }
+
+    Tensor graph_result;
+    if (try_run_attention_graph(q, k, v, scale, use_fp16_value_gemm, orig_dtype, graph_result)) {
+        return graph_result;
+    }
+
+    // ---- ensure f32 contiguous ----
+    Tensor qf = ensure_f32(q);   // [B, H, N,   D]
+    Tensor kf = ensure_f32(k);   // [B, H, N_k, D]
+    Tensor vf = ensure_f32(v);   // [B, H, N_k, D]
+    Tensor vh;
+    if (use_fp16_value_gemm) {
+        vh = vf.to_f16().contiguous();
     }
 
     const int64_t BH = B * H;
@@ -167,87 +560,21 @@ Tensor scaled_dot_product_attention(const Tensor& q, const Tensor& k, const Tens
     } else {
         // Fallback to cuBLAS GEMM-based attention for large head dims
         Tensor scores = Tensor::empty({BH, N, N_k}, DType::Float32);
-
+        Tensor scores_half;
         cublasHandle_t handle = CudaContext::instance().cublas();
-
-        // GEMM 1: scores = Q @ K^T
-        {
-            float alpha = 1.0f;
-            float beta  = 0.0f;
-            int m = static_cast<int>(N);
-            int n = static_cast<int>(N_k);
-            int kk = static_cast<int>(D);
-            long long int strideA = static_cast<long long int>(N * D);
-            long long int strideB = static_cast<long long int>(N_k * D);
-            long long int strideC = static_cast<long long int>(N * N_k);
-
-            if (use_fp16_attention) {
-                cublasGemmStridedBatchedEx(handle,
-                    CUBLAS_OP_T, CUBLAS_OP_N,
-                    n, m, kk, &alpha,
-                    kh.data_ptr(), CUDA_R_16F, kk, strideB,
-                    qh.data_ptr(), CUDA_R_16F, kk, strideA,
-                    &beta, scores.data_f32(), CUDA_R_32F, n, strideC,
-                    static_cast<int>(BH),
-                    CUBLAS_COMPUTE_32F,
-                    CUBLAS_GEMM_DEFAULT_TENSOR_OP);
-            } else {
-                cublasGemmStridedBatchedEx(handle,
-                    CUBLAS_OP_T, CUBLAS_OP_N,
-                    n, m, kk, &alpha,
-                    kf.data_f32(), CUDA_R_32F, kk, strideB,
-                    qf.data_f32(), CUDA_R_32F, kk, strideA,
-                    &beta, scores.data_f32(), CUDA_R_32F, n, strideC,
-                    static_cast<int>(BH),
-                    CUBLAS_COMPUTE_32F_FAST_TF32,
-                    CUBLAS_GEMM_DEFAULT_TENSOR_OP);
-            }
+        if (use_fp16_value_gemm) {
+            scores_half = Tensor::empty({BH, N, N_k}, DType::Float16);
         }
-
-        // Fused Scale + Softmax (2 memory passes instead of 5)
-        {
-            int total_rows = static_cast<int>(BH * N);
-            int cols = static_cast<int>(N_k);
-            int threads_po2 = 1;
-            while (threads_po2 < cols && threads_po2 < kBlockSize) threads_po2 <<= 1;
-            size_t smem_bytes = threads_po2 * sizeof(float);
-            fused_scale_softmax_kernel<<<total_rows, threads_po2, smem_bytes>>>(
-                scores.data_f32(), scale, total_rows, cols);
-        }
-
-        // GEMM 2: out = attn_weights @ V
-        {
-            float alpha = 1.0f;
-            float beta  = 0.0f;
-            int m = static_cast<int>(N);
-            int kk = static_cast<int>(N_k);
-            int n = static_cast<int>(D);
-            long long int strideA = static_cast<long long int>(N * N_k);
-            long long int strideB = static_cast<long long int>(N_k * D);
-            long long int strideC = static_cast<long long int>(N * D);
-
-            if (use_fp16_attention) {
-                cublasGemmStridedBatchedEx(handle,
-                    CUBLAS_OP_N, CUBLAS_OP_N,
-                    n, m, kk, &alpha,
-                    vh.data_ptr(), CUDA_R_16F, n, strideB,
-                    scores.data_f32(), CUDA_R_32F, kk, strideA,
-                    &beta, out.data_f32(), CUDA_R_32F, n, strideC,
-                    static_cast<int>(BH),
-                    CUBLAS_COMPUTE_32F,
-                    CUBLAS_GEMM_DEFAULT_TENSOR_OP);
-            } else {
-                cublasGemmStridedBatchedEx(handle,
-                    CUBLAS_OP_N, CUBLAS_OP_N,
-                    n, m, kk, &alpha,
-                    vf.data_f32(), CUDA_R_32F, n, strideB,
-                    scores.data_f32(), CUDA_R_32F, kk, strideA,
-                    &beta, out.data_f32(), CUDA_R_32F, n, strideC,
-                    static_cast<int>(BH),
-                    CUBLAS_COMPUTE_32F_FAST_TF32,
-                    CUBLAS_GEMM_DEFAULT_TENSOR_OP);
-            }
-        }
+        launch_materialized_attention(handle,
+                                      qf,
+                                      kf,
+                                      vf,
+                                      use_fp16_value_gemm ? &vh : nullptr,
+                                      use_fp16_value_gemm,
+                                      scale,
+                                      out,
+                                      scores,
+                                      use_fp16_value_gemm ? &scores_half : nullptr);
     }
 
     // Reshape output from [B*H, N, D] to [B, H, N, D]

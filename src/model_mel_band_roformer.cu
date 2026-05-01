@@ -703,12 +703,15 @@ Tensor MelBandRoformer::apply_mask_estimator(const Tensor& x,
     int64_t T = x.size(1);
     int num_bands = cfg_.num_bands;
 
+    // Materialize [band, batch, time, dim] once so each per-band view stays contiguous.
+    Tensor x_by_band = x.permute({2, 0, 1, 3}).contiguous();
+
     std::vector<Tensor> band_outputs;
     band_outputs.reserve(num_bands);
 
     for (int b = 0; b < num_bands; b++) {
-        // Extract band features: x[:, :, b, :] -> [B, T, dim]
-        Tensor band_x = x.slice(2, b, b + 1).squeeze(2).contiguous();
+        // Extract band features from the prepacked band-major buffer: [B, T, dim]
+        Tensor band_x = x_by_band.slice(0, b, b + 1).squeeze(0);
 
         const auto& mlp = w.band_mlps[b];
         int num_linears = (int)mlp.linear_w.size();
